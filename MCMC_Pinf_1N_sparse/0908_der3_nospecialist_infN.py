@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
-#torch.set_default_dtype(torch.float64)
+
 # ----------------------------- Utils -----------------------------
 
 def check_gpu():
@@ -78,8 +78,7 @@ class SAEMParams:
     max_iters: int = 4000
     a0: float = 0.5
     t0: float = 100.0
-    damping_m: float = 1.0      # was: damping
-    damping_chi: float = 2.0 
+    damping: float = 1.0
     eps_D: float = 1e-6
     eps_proj: float = 1e-3
     print_every: int = 50
@@ -89,26 +88,27 @@ class SAEMParams:
 def compute_J_Sigma(
     w: torch.Tensor, X: torch.Tensor, chi_S_vec: torch.Tensor, act: str
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    z = X @ w.T                # (R,B)
-    phi = activation(z, act)   # (R,B)
-    J = (phi * chi_S_vec[:, None]).mean(dim=0)  # (B,)
-    Sigma = (phi * phi).mean(dim=0)             # (B,)
+    z = X @ w.T                 # (R,B)
+    phi = activation(z, act)    # (R,B)
+    J = (phi * chi_S_vec[:, None]).mean(dim=0)  # (B,)  -> J_S(w)
+    Sigma = (phi * phi).mean(dim=0)             # (B,)  -> Σ(w)
     return J, Sigma
 
-# ----------------------------- logπ and grad -----------------------------
+# ----------------------------- logπ and grad (∞-width / no TAP) -----------------------------
 
 def compute_logp_and_grad(
     w: torch.Tensor, X: torch.Tensor, chi_S_vec: torch.Tensor,
-    m: float, chi: float, kappa: float,
+    m: float, kappa: float,
     mdl: ModelParams, saem: SAEMParams, mcmc: MCMCParams
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Gibbs density for w after integrating out a:
+    Infinite-width, infinite-data effective single-neuron density after integrating out 'a':
       g_w^2 = sigma_w / d
       g_a^2 = sigma_a / N^gamma
       A     = 1 / g_a^2  = N^gamma / sigma_a
-      D     = A*kappa^2 + Sigma - (chi/N) J^2
-      logp  = -||w||^2/(2 g_w^2) - 0.5*log D + ((1-m)^2/(2 kappa^2)) * (J^2 / D)
+      D∞    = A*kappa^2 + Sigma
+      For parity teacher (single mode): J_Y = J_S, and sum_A m_A J_A = m J_S
+      logp  = -||w||^2/(2 g_w^2) - 0.5*log D∞ + ((J_Y - m J_S)^2) / (2 kappa^2 D∞)
     """
     gw2 = mdl.sigma_w / mdl.d
     ga2 = mdl.sigma_a / (mdl.N ** mdl.gamma)
@@ -117,15 +117,18 @@ def compute_logp_and_grad(
     w = w.detach().requires_grad_(True)
 
     J, Sigma = compute_J_Sigma(w, X, chi_S_vec, mdl.act)
-    D = A * (kappa**2) + Sigma - (chi / mdl.N) * (J * J)
+    D = A * (kappa**2) + Sigma                      # <-- no 1/N correction
     D_safe = torch.clamp(D, min=saem.eps_D)
+
+    # Parity teacher: J_Y = J
+    JY_minus_mJ = J - m * J                         # = (1 - m)*J
 
     # log prior: - ||w||^2 / (2 g_w^2)
     prior_term = -0.5 * (w * w).sum(dim=1) / gw2
 
-    # terms from integrating out a
+    # terms from integrating out a (no TAP corrections)
     log_det_term = -0.5 * torch.log(D_safe)
-    data_term    = ((1.0 - m)**2) / (2.0 * (kappa**2)) * (J * J) / D_safe
+    data_term    = (JY_minus_mJ * JY_minus_mJ) / (2.0 * (kappa**2) * D_safe)
 
     logp = prior_term + log_det_term + data_term
 
@@ -140,13 +143,13 @@ def compute_logp_and_grad(
 
 def mcmc_sgld(
     w: torch.Tensor, X: torch.Tensor, chi_S_vec: torch.Tensor,
-    m: float, chi: float, kappa: float,
+    m: float, kappa: float,
     mdl: ModelParams, saem: SAEMParams, mcmc: MCMCParams
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     step = mcmc.step_size
     for _ in range(mcmc.n_steps):
         _, grad, J, Sigma = compute_logp_and_grad(
-            w, X, chi_S_vec, m, chi, kappa, mdl, saem, mcmc
+            w, X, chi_S_vec, m, kappa, mdl, saem, mcmc
         )
         if mcmc.langevin_sqrt2:
             noise = torch.randn_like(w) * math.sqrt(2.0 * step)
@@ -160,35 +163,18 @@ def mcmc_sgld(
         step *= mcmc.step_decay
     return w.detach(), J.detach(), Sigma.detach()
 
-# ----------------------------- Feasibility (D>0) -----------------------------
+# ----------------------------- Feasibility (trivial here) -----------------------------
 
-def feasible_project(m: float, chi: float, mdl: ModelParams, rho_cap: float, saem: SAEMParams):
+def feasible_project(m: float, mdl: ModelParams, saem: SAEMParams):
     """
-    Enforce positivity of D using a per-iteration cap on rho:
-        chi <= (1 - eps_proj) * N / rho_cap
-    and 0 <= m <= 1.
-
-    rho_cap should be a robust 'worst-case' estimate (e.g., high quantile)
-    of rho = J^2 / (A*kappa^2 + Sigma) computed on the CURRENT batch.
+    In the infinite-width/no-TAP setting D∞ = A*kappa^2 + Σ >= A*kappa^2 > 0,
+    so we only need 0 <= m <= 1.
+    Return shape kept similar to original (bound is dummy 'inf').
     """
-    import math
-
-    if (rho_cap is None) or (rho_cap <= 0.0) or (not math.isfinite(rho_cap)):
-        bound = float("inf")
-    else:
-        bound = (1.0 - saem.eps_proj) * mdl.N / rho_cap
-
-    # Project to the feasible box
     m_proj = min(max(m, 0.0), 1.0)
-    if math.isfinite(bound):
-        chi_proj = min(max(chi, 0.0), bound)
-    else:
-        chi_proj = max(chi, 0.0)
+    return m_proj, float("inf")
 
-    return m_proj, chi_proj, bound
-
-
-# ----------------------------- SAEM Loop (pooled estimator) -----------------------------
+# ----------------------------- SAEM Loop (single fixed-point for m) -----------------------------
 
 def saem_solve_for_kappa(
     kappa: float, devices: List[int],
@@ -214,17 +200,11 @@ def saem_solve_for_kappa(
         max_iters=BASE.get("opt_steps", 4000),
         a0=BASE.get("a0", 0.5),
         t0=BASE.get("t0", 100.0),
-        damping_m=BASE.get("damping_m", 1.0),
-        damping_chi=BASE.get("damping_chi", 2.0),
+        damping=BASE.get("damping", 1.0),
         eps_D=BASE.get("eps_D", 1e-6),
         eps_proj=BASE.get("eps_proj", 1e-3),
         print_every=BASE.get("print_every", 50),
     )
-
-    # NEW: robust ρ settings (safe defaults if not present in BASE)
-    rho_quantile = float(BASE.get("rho_quantile", 0.999))   # e.g., 0.999, 0.9995, 0.9999
-    use_rho_ema = bool(BASE.get("use_rho_ema", True))
-    rho_ema_beta = float(BASE.get("rho_ema_beta", 0.9))     # EMA smoothing factor
 
     # Teacher indices
     S = make_parity_indices(mdl.d, mdl.k, seed=BASE.get("teacher_seed", 0))
@@ -245,21 +225,12 @@ def saem_solve_for_kappa(
         per_dev.append({"device": device, "X": X, "chi_vec": chi_vec, "w": w})
         total_chains += chains
 
-    # Init order parameters and PR averages
+    # Init order parameter and PR average
     m = BASE.get("m_init", 0.0)
-    chi = BASE.get("chi_init", 1e-6)
-    m_bar, chi_bar = m, chi
+    m_bar = m
 
     history = []
     t_start = time.time()
-
-    # Constants for D / rho calculation
-    ga2 = mdl.sigma_a / (mdl.N ** mdl.gamma)
-    A = 1.0 / ga2
-
-    # EMA state
-    rho_cap_prev = None
-    last_rho_cap = None
 
     for it in range(1, saem.max_iters + 1):
         # accumulators (pooled over all chains / devices)
@@ -267,40 +238,28 @@ def saem_solve_for_kappa(
         g2_sum = 0.0
         n_sum  = 0
 
-        # for robust chi-bound this iteration
-        rho_q_vals = []
-
         # E-step: refresh chains & collect pooled stats
         for slot in per_dev:
             device = slot["device"]
             X, chi_vec, w = slot["X"], slot["chi_vec"], slot["w"]
 
-            w, J, Sigma = mcmc_sgld(w, X, chi_vec, m, chi, kappa, mdl, saem, mcmc)
+            w, J, Sigma = mcmc_sgld(w, X, chi_vec, m, kappa, mdl, saem, mcmc)
             slot["w"] = w
-            # cache last J,Sigma for post-projection safety check
-            slot["_last_J"] = J
-            slot["_last_Sigma"] = Sigma
 
-            # D with corrected scalings
-            D = A * (kappa**2) + Sigma - (chi / mdl.N) * (J * J)
+            # A, D∞ with corrected scalings (no TAP)
+            ga2 = mdl.sigma_a / (mdl.N ** mdl.gamma)
+            A = 1.0 / ga2
+            D = A * (kappa**2) + Sigma
             D = torch.clamp(D, min=saem.eps_D)
 
-            # pooled statistics for TAP
+            # pooled statistics for fixed-point
             g1 = (J * J) / D
+            # g2 kept for logging parity with TAP code (not used in update here)
             g2 = ((J * J) * (J * J)) / ((kappa**2) * (D * D))
 
             g1_sum += g1.sum().item()
             g2_sum += g2.sum().item()
             n_sum  += g1.numel()
-
-            # per-device robust rho quantile for chi bound
-            rho_vals = (J * J) / (A * (kappa**2) + Sigma)
-            try:
-                rho_q = torch.quantile(rho_vals, rho_quantile).item()
-            except Exception:
-                # fallback for very small batches / edge cases
-                rho_q = rho_vals.max().item()
-            rho_q_vals.append(rho_q)
 
         # finalize pooled averages
         g1_mean = g1_sum / max(1, n_sum)
@@ -309,60 +268,24 @@ def saem_solve_for_kappa(
         # Robbins–Monro step size
         a_t = saem.a0 / (it + saem.t0)
 
-        # Fixed-point residuals (pooled estimator)
-        F1 = m   - mdl.N * (1.0 - m) * g1_mean
-        F2 = chi - mdl.N * (1.0 - m) * (1.0 - m) * g2_mean - mdl.N * g1_mean
+        # Fixed-point residual (single equation)
+        F1 = m - mdl.N * (1.0 - m) * g1_mean
 
-        # Parameter proposals
-        m_new   = m   - saem.damping_m  * a_t * F1
-        chi_new = chi - saem.damping_chi * a_t * F2
+        # Parameter update for m only
+        m_new = m - saem.damping * a_t * F1
 
-        # --- NEW: robust per-iteration rho cap (quantile), optional EMA ---
-        rho_cap_cur = max(rho_q_vals) if len(rho_q_vals) > 0 else 0.0
-        if use_rho_ema and (rho_cap_prev is not None):
-            rho_cap = rho_ema_beta * rho_cap_prev + (1.0 - rho_ema_beta) * rho_cap_cur
-        else:
-            rho_cap = rho_cap_cur
-        rho_cap_prev = rho_cap
-        last_rho_cap = rho_cap  # keep for result dict
+        # Projection 0<=m<=1 (keep interface similar)
+        m, _m_bound = feasible_project(m_new, mdl, saem)
 
-        # Projection for feasibility (D>0) and bounds using CURRENT rho cap
-        m, chi, chi_bound = feasible_project(m_new, chi_new, mdl, rho_cap, saem)
-
-        # --- NEW: post-projection safety backoff if any current-chain D <= eps_D ---
-        # shrink chi slightly until all cached D are positive
-        for _ in range(5):  # small loop; usually 0 iterations
-            any_bad = False
-            for slot in per_dev:
-                J = slot["_last_J"]
-                Sigma = slot["_last_Sigma"]
-                Dchk = A * (kappa**2) + Sigma - (chi / mdl.N) * (J * J)
-                if (Dchk <= saem.eps_D).any():
-                    any_bad = True
-                    break
-            if not any_bad:
-                break
-            chi *= 0.95  # multiplicative backoff
-
-        # Polyak–Ruppert averages (optional, kept for logging)
-        m_bar   = ((it-1)*m_bar   + m  ) / it
-        chi_bar = ((it-1)*chi_bar + chi) / it
-
-        # helpful diagnostics
-        Ng1 = mdl.N * g1_mean
-        m_fixed = Ng1 / (1.0 + Ng1)
-        chi_at_bound = float(1.0 if (chi_bound < float("inf") and chi >= 0.999999 * chi_bound) else 0.0)
+        # Polyak–Ruppert average (optional, kept for logging)
+        m_bar = ((it-1)*m_bar + m) / it
 
         if it % saem.print_every == 0 or it == 1:
             dt = time.time() - t_start
             msg = {
                 "iter": it, "kappa": kappa,
-                "m": m, "chi": chi,
-                "m_bar": m_bar, "chi_bar": chi_bar,
+                "m": m, "m_bar": m_bar,
                 "g1_mean": g1_mean, "g2_mean": g2_mean,
-                "Ng1": Ng1, "m_fixed": m_fixed,
-                "rho_cap": last_rho_cap, "rho_quantile": rho_quantile,
-                "chi_bound": chi_bound, "chi_at_bound": chi_at_bound,
                 "time_s": round(dt, 2)
             }
             print(json.dumps(msg))
@@ -371,21 +294,19 @@ def saem_solve_for_kappa(
     # Final snapshot
     result = {
         "kappa": kappa,
-        "m_final": m, "chi_final": chi,
-        "m_bar": m_bar, "chi_bar": chi_bar,
-        "rho_cap_last": last_rho_cap,
+        "m_final": m,
+        "m_bar": m_bar,
         "history": history[-10:],  # last few for quick glance
         "BASE": BASE
     }
 
     os.makedirs(SAVE_DIR, exist_ok=True)
     tag = run_tag if run_tag else f"kappa_{kappa:.6f}"
-    out_path = os.path.join(SAVE_DIR, f"saem_nomix_result_{tag}.json")
+    out_path = os.path.join(SAVE_DIR, f"saem_infwidth_result_{tag}.json")
     with open(out_path, "w") as f:
         json.dump(result, f, indent=2)
     print(f"[saved] {out_path}")
     return result
-
 
 # ----------------------------- Main -----------------------------
 
@@ -394,45 +315,43 @@ if __name__ == "__main__":
     devices = check_gpu()
 
     BASE = dict(
-        d=25, N=1024, k=4,
+        d=40, N=1024, k=4,
         σa=1.0, σw=1.0, γ=1.0,
         act="relu",
-        opt_steps=1500,
+        opt_steps=4000,
         # MCMC controls
-        R_inputs=16384,
-        chains_per_device=4096,
-        mcmc_steps=400,
-        mcmc_step_size=3e-3,
+        R_inputs=8192,
+        chains_per_device=8192,
+        mcmc_steps=30,
+        mcmc_step_size=5e-3,
         mcmc_step_decay=0.999,
         langevin_sqrt2=True,
-        grad_clip=1e5,
-        clamp_w=100.0,
+        grad_clip=10.0,
+        clamp_w=10.0,
         # SAEM controls
-        a0=0.5, t0=100.0,damping_m=1.0, damping_chi=2.0,
-        eps_D=1e-6, eps_proj=1e-3, print_every=5,
+        a0=0.5, t0=100.0, damping=1.0,
+        eps_D=1e-6, eps_proj=1e-3, print_every=50,
         # Seeds
         teacher_seed=0, data_seed=0,
-        # inits
-        m_init=0.5, chi_init=1e-6,
+        # init
+        m_init=0.2,
     )
 
-    # Warm start from large -> small kappa
-    kappa_list = sorted(np.logspace(np.log10(1e-4), np.log10(5e1), 15),reverse=True ) #sorted(np.logspace(np.log10(1e-5), np.log10(5e1), 25), reverse=True)
+    # Warm start from large -> small kappa (you can reverse if you prefer)
+    kappa_list = np.logspace(np.log10(1e-4), np.log10(5e1), 30)
 
-    # Choose a save directory you have write access to
-    save_dir = "/home/goring/mean_field_langevin/MCMC_Pinf_1N_sparse/results/1808_d25k4_nospecialst_fast"
+    # Save directory
+    save_dir = "/home/goring/mean_field_langevin/MCMC_Pinf_1N_sparse/results/1808_d40k4_nospecialst_infN"
     os.makedirs(save_dir, exist_ok=True)
 
     run_tag_prefix = time.strftime("%Y%m%d_%H%M%S")
 
     # Warm start across kappas
-    m_ws  = BASE.get("m_init", 0.0)
-    chi_ws= BASE.get("chi_init", 1e-6)
+    m_ws = BASE.get("m_init", 0.0)
 
     for idx, kappa in enumerate(kappa_list):
-        print(f"\n=== SAEM (pooled) for kappa={kappa} ===")
+        print(f"\n=== SAEM (∞-width) for kappa={kappa} ===")
         BASE["m_init"] = m_ws
-        BASE["chi_init"] = chi_ws
         tag = f"{run_tag_prefix}_k{idx}_{kappa:.6f}"
         result = saem_solve_for_kappa(
             kappa=kappa,
@@ -441,4 +360,4 @@ if __name__ == "__main__":
             SAVE_DIR=save_dir,
             run_tag=tag
         )
-        m_ws, chi_ws = result["m_final"], result["chi_final"]
+        m_ws = result["m_final"]

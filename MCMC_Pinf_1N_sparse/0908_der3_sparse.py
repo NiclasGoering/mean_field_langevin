@@ -376,7 +376,7 @@ if __name__ == "__main__":
     devices = check_gpu()
 
     BASE = dict(
-        d=50, N=1024, k=6,
+        d=40, N=1024, k=4,
         σa=1.0, σw=1.0, γ=1.0,
         act="relu",
         opt_steps=4000,
@@ -395,16 +395,16 @@ if __name__ == "__main__":
         # Seeds
         teacher_seed=0, data_seed=0,
         # Inits
-        m_init=0.2, chi_init=1e-6, pi_init=0.01,
+        m_init=0.5, chi_init=1e-6, pi_init=0.01,
         # π prior (optional): Beta(a,b); (1,1) means π ≈ mean(r)
         beta_a=1.0, beta_b=1.0,
         pi_floor=1e-6,
     )
 
     # Sweep κ from large → small (warm starts)
-    kappa_list = sorted(np.logspace(np.log10(1e-5), np.log10(5e1), 30), reverse=True)
+    kappa_list = np.logspace(np.log10(1e-4), np.log10(5e1), 30)
 
-    save_dir = "/home/goring/mean_field_langevin/MCMC_Pinf_1N_sparse/results/0708_d50k6_sparse"
+    save_dir = "/home/goring/mean_field_langevin/MCMC_Pinf_1N_sparse/results/1808_d40k4_nospecialst_sparse"
     os.makedirs(save_dir, exist_ok=True)
 
     run_tag_prefix = time.strftime("%Y%m%d_%H%M%S")

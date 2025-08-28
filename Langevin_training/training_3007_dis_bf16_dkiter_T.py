@@ -9,14 +9,13 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import numpy as np
 import torch.nn.functional as F
-
-# Import autocast for mixed precision
 from torch.cuda.amp import autocast
 
 
 def generate_k_sparse_parity_data(P, d, k, device='cpu'):
     """
     Generates a dataset for the k-sparse parity problem on the specified device.
+    X in {-1,+1}^{Pxd}, y = product of first k features.
     """
     if k > d:
         raise ValueError("k (number of sparse features) cannot be greater than d (dimensionality).")
@@ -28,20 +27,29 @@ def generate_k_sparse_parity_data(P, d, k, device='cpu'):
 
 class TwoLayerNet(nn.Module):
     """
-    A two-layer neural network as specified by the user.
-    f(x) = sum_i a_i * phi(w_i^T * x)
+    f(x) = sum_i a_i * phi(w_i^T x).
+    Prior (paper): Var(w_ij) = σ_w/d, Var(a_i) = σ_a/N^γ.
+    We pass g_w=σ_w and g_a=σ_a here.
     """
     def __init__(self, d, N, g_w, g_a, gamma_scaling_exponent):
         super().__init__()
         self.d = d
         self.N = N
-        sigma_w_sq = g_w / d
-        sigma_a_sq = g_a / (N ** gamma_scaling_exponent)
-        self.sigma_w = torch.tensor(sigma_w_sq**0.5)
-        self.sigma_a = torch.tensor(sigma_a_sq**0.5)
+
+        # Prior variances
+        sigma_w_var = g_w / d                                # Var(w_ij)
+        sigma_a_var = g_a / (N ** gamma_scaling_exponent)    # Var(a_i)
+
+        # Store stds for init AND store prior variances explicitly
+        self.sigma_w = torch.tensor(sigma_w_var**0.5)
+        self.sigma_a = torch.tensor(sigma_a_var**0.5)
+        self.var_w0  = float(sigma_w_var)   # prior Var(w_ij)
+        self.var_a0  = float(sigma_a_var)   # prior Var(a_i)
+
         self.w = nn.Parameter(torch.randn(d, N) * self.sigma_w)
         self.a = nn.Parameter(torch.randn(N, 1) * self.sigma_a)
-        self.phi = F.relu  # functional call (slightly leaner)
+
+        self.phi = F.relu
 
     def forward(self, x):
         pre_activation = x @ self.w
@@ -50,57 +58,56 @@ class TwoLayerNet(nn.Module):
         return output
 
 
-def plot_and_save_weights(initial_w, final_w, initial_a, final_a, P, d, k, exp_id, kappa_0, eta, save_path):
-    """
-    Creates and saves a 2x2 plot of weight distributions before and after training.
-    """
-    # Ensure tensors are on CPU for plotting
+def plot_and_save_weights(initial_w, final_w, initial_a, final_a, P, d, k, exp_id, kappa_0, save_path):
+    """Creates and saves a 2x2 plot of weight distributions before and after training."""
     initial_w, final_w = initial_w.cpu(), final_w.cpu()
     initial_a, final_a = initial_a.cpu(), final_a.cpu()
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 12))
     sns.set_style("whitegrid")
 
-    # Plot initial 'w' distribution
     sns.histplot(initial_w.flatten(), ax=axes[0, 0], kde=True, stat="density", bins=50)
     axes[0, 0].set_title(f"Initial 'w' (std: {initial_w.std():.4f})")
     axes[0, 0].set_xlabel("Weight Value")
 
-    # Plot final 'w' distribution
     sns.histplot(final_w.flatten(), ax=axes[0, 1], kde=True, stat="density", bins=50)
     axes[0, 1].set_title(f"Final 'w' (std: {final_w.std():.4f})")
     axes[0, 1].set_xlabel("Weight Value")
 
-    # Plot initial 'a' distribution
     sns.histplot(initial_a.flatten(), ax=axes[1, 0], kde=True, stat="density", bins=50)
     axes[1, 0].set_title(f"Initial 'a' (std: {initial_a.std():.4f})")
     axes[1, 0].set_xlabel("Weight Value")
 
-    # Plot final 'a' distribution
     sns.histplot(final_a.flatten(), ax=axes[1, 1], kde=True, stat="density", bins=50)
     axes[1, 1].set_title(f"Final 'a' (std: {final_a.std():.4f})")
     axes[1, 1].set_xlabel("Weight Value")
 
-    fig.suptitle(f'Weight Distributions | P={P}, d={d}, k={k}, exp={exp_id}, κ₀={kappa_0}, η={eta}', fontsize=16)
+    fig.suptitle(f'Weight Distributions | P={P}, d={d}, k={k}, exp={exp_id}, κ₀={kappa_0}', fontsize=16)
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
     plt.savefig(save_path)
-    plt.close(fig)  # Close the figure to free up memory
+    plt.close(fig)
 
 
 def train_with_langevin(model, X_train, y_train, X_test, y_test, hyperparams, current_config, rank):
     """
-    Trains the model using full-batch Langevin GD with mini-batch accumulation.
-    >>> Optimized for H100 with bfloat16 and reduced host/device sync. <<<
+    Full-batch Langevin GD with mini-batch accumulation.
+    Includes ONLY the variance/Σ-based κ_eff diagnostic:
+        κ_i^2 = Σ_i / (1/Var(a_i) - A),  A = 1/var_a0 = N^γ / σ_a
+    Reports median(κ_i^2) and its sqrt.
     """
-    # Unpack hyperparameters (fixed across jobs)
+    # --- Hyperparams ---
+    eta = hyperparams['eta']
     epochs = hyperparams['epochs']
     log_interval = hyperparams['log_interval']
     batch_size = hyperparams['batch_size']
     early_stop_loss = hyperparams['early_stop_loss']
     early_stop_error = hyperparams['early_stop_error']
 
-    # Per-job (grid) parameters
-    eta = current_config['eta']  # <-- learning rate comes from the job config
+    # EMA controls for Var(a_i)
+    beta_ema = hyperparams.get('temp_ema_beta', 0.9)
+    eps_var  = hyperparams.get('temp_eps_var', 1e-12)
+    sigma_phi2_min = hyperparams.get('sigma_phi2_min', 0.0)  # optional filter for dead ReLUs (0 keeps all)
+
     P_train = X_train.shape[0]
 
     uncompiled_model = model._orig_mod if hasattr(model, '_orig_mod') else model
@@ -111,8 +118,11 @@ def train_with_langevin(model, X_train, y_train, X_test, y_test, hyperparams, cu
     kappa_0 = current_config['kappa_0']
     gamma_scaling_exponent = hyperparams['gamma_scaling_exponent']
 
+    # Nominal κ and T used in SGLD
     kappa = kappa_0 * (N ** (1 - gamma_scaling_exponent))
     T = 2 * (kappa ** 2)
+    kappa_nominal = float(kappa)
+    T_nominal = float(T)
 
     loss_fn = nn.MSELoss(reduction='sum')
 
@@ -120,17 +130,29 @@ def train_with_langevin(model, X_train, y_train, X_test, y_test, hyperparams, cu
     k = current_config['k']
     exp_id = current_config['exp_id']
 
-    print(f"GPU {rank} | Start (bf16): P={P_train}, d={d}, k={k}, exp={exp_id}, N={N}, k0={kappa_0:.3f}, eta={eta:.1e}, T={T:.4f}")
+    print(f"GPU {rank} | Start (bf16): P={P_train}, d={d}, k={k}, exp={exp_id}, N={N}, k0={kappa_0:.3f}, T={T:.4f}")
     start_time = time.time()
 
-    # local tensor accumulators to avoid CPU syncs in the loop
+    # EMA of a and a^2 (per neuron, shape [N,1])
+    ema_a  = uncompiled_model.a.detach().clone()
+    ema_a2 = (uncompiled_model.a.detach() ** 2).clone()
+
+    # κ_eff diagnostics (last computed at a log step)
+    kappa_eff_sq_median = float('nan')
+    kappa_eff_median = float('nan')
+    valid_frac = 0.0
+
+    # --- Training loop ---
     for epoch in range(epochs + 1):
         model.train()
 
-        # Reset grads & accumulators
         model.zero_grad(set_to_none=True)
         train_loss_accum = torch.zeros((), device=X_train.device, dtype=torch.float32)
         train_correct_accum = 0
+
+        # accumulate Σ_i = E[φ^2] across this epoch
+        sum_phi2 = torch.zeros(uncompiled_model.N, device=X_train.device)
+        n_seen   = 0
 
         # Mini-batch accumulation
         for i in range(0, P_train, batch_size):
@@ -142,16 +164,19 @@ def train_with_langevin(model, X_train, y_train, X_test, y_test, hyperparams, cu
                 y_pred_batch = model(X_batch)
                 batch_loss = loss_fn(y_pred_batch, y_batch)
 
-            # Accumulate loss on GPU (no .item() here)
             train_loss_accum += batch_loss.detach()
 
-            # Accumulate 0-1 training accuracy inline to avoid a second pass
-            # (detach to keep it out of autograd)
             pred_sign = torch.sign(y_pred_batch.detach())
             train_correct_accum += (pred_sign == y_batch).sum().item()
 
-            # Backward; normalize by total samples for stable scaling
             (batch_loss / P_train).backward()
+
+            with torch.no_grad():
+                # compute φ(w^T x) on this batch using the *uncompiled* module
+                pre = X_batch @ uncompiled_model.w
+                phi = F.relu(pre)
+                sum_phi2 += (phi * phi).sum(dim=0)  # [N]
+                n_seen += X_batch.size(0)
 
         # Manual Langevin update (parameters in fp32)
         with torch.no_grad():
@@ -176,17 +201,49 @@ def train_with_langevin(model, X_train, y_train, X_test, y_test, hyperparams, cu
                 train_mse = (train_loss_accum / P_train).item()
                 train_error_01 = 1.0 - (train_correct_accum / P_train)
 
-                # Test evaluation in bfloat16
                 with autocast(dtype=torch.bfloat16):
                     y_pred_test = model(X_test)
                 test_mse = (loss_fn(y_pred_test, y_test) / X_test.shape[0]).item()
                 test_error_01 = (torch.sign(y_pred_test) != y_test).float().mean().item()
 
+                # ---- update EMA of a and a^2 (per neuron) ----
+                a_now = uncompiled_model.a.detach()
+                ema_a  = beta_ema * ema_a  + (1 - beta_ema) * a_now
+                ema_a2 = beta_ema * ema_a2 + (1 - beta_ema) * (a_now * a_now)
+                var_a_i = (ema_a2 - ema_a * ema_a).clamp_min(eps_var)  # [N,1]
+
+                # ---- compute per-neuron Σ_i from this epoch’s accumulated phi^2 ----
+                if n_seen > 0:
+                    Sigma_i = (sum_phi2 / n_seen).reshape(-1, 1)  # [N,1]
+                else:
+                    Sigma_i = torch.full_like(uncompiled_model.a, float('nan'))
+
+                # ---- κ_i^2 = Σ_i / (1/Var(a_i) - A) with A = 1/var_a0 ----
+                A = 1.0 / uncompiled_model.var_a0   # = N^γ / σ_a
+                denom = (1.0 / var_a_i) - A
+
+                finite_mask = torch.isfinite(denom) & torch.isfinite(Sigma_i)
+                pos_mask = denom > 0
+                sigma_mask = Sigma_i > sigma_phi2_min
+                valid = finite_mask & pos_mask & sigma_mask
+
+                if valid.any():
+                    kappa_eff_i_sq = Sigma_i[valid] / denom[valid]           # κ^2_i
+                    kappa_eff_sq_median = float(kappa_eff_i_sq.median().item())
+                    kappa_eff_median = float(np.sqrt(max(kappa_eff_sq_median, 0.0)))
+                    valid_frac = float(valid.float().mean().item())
+                else:
+                    kappa_eff_sq_median = float('nan')
+                    kappa_eff_median = float('nan')
+                    valid_frac = 0.0
+
                 elapsed_time = time.time() - start_time
                 print(
-                    f"GPU {rank} | P={P_train}, d={d}, k={k}, exp={exp_id}, k0={kappa_0:.3f}, eta={eta:.1e} | "
+                    f"GPU {rank} | P={P_train}, d={d}, k={k}, exp={exp_id}, k0={kappa_0:.3f} | "
                     f"Ep {epoch:6d} | Train MSE: {train_mse:.4f} | Test MSE: {test_mse:.4f} | "
                     f"Train Err: {train_error_01:.4f} | Test Err: {test_error_01:.4f} | "
+                    f"κ_nom: {kappa_nominal:.3e} | median(κ^2): {kappa_eff_sq_median:.3e} | "
+                    f"median(κ): {kappa_eff_median:.3e} | valid: {valid_frac:.2f} | "
                     f"Time: {elapsed_time:.2f}s"
                 )
 
@@ -197,26 +254,32 @@ def train_with_langevin(model, X_train, y_train, X_test, y_test, hyperparams, cu
                         "train_error_01": float('nan'), "test_error_01": float('nan'),
                     }
 
-                #if train_mse < early_stop_loss or train_error_01 < early_stop_error:
-                #    print(f"GPU {rank} | Early stopping at epoch {epoch}.")
-                #    break
+                if train_mse < early_stop_loss or train_error_01 < early_stop_error:
+                    print(f"GPU {rank} | Early stopping at epoch {epoch}.")
+                    break
 
-    # Final evaluation
+    # Final eval
     model.eval()
     with torch.no_grad():
         final_train_mse = train_mse
         final_train_error_01 = train_error_01
-
         with autocast(dtype=torch.bfloat16):
             y_pred_test = model(X_test)
         final_test_mse = (loss_fn(y_pred_test, y_test) / X_test.shape[0]).item()
         final_test_error_01 = (torch.sign(y_pred_test) != y_test).float().mean().item()
 
-    print(f"GPU {rank} | Finished: P={P_train}, d={d}, k={k}, exp={exp_id}, κ₀={kappa_0:.3f}, η={eta:.1e}")
+    print(f"GPU {rank} | Finished: P={P_train}, d={d}, k={k}, exp={exp_id}, κ₀={kappa_0:.3f}")
 
     return {
-        "train_mse": final_train_mse, "test_mse": final_test_mse,
-        "train_error_01": final_train_error_01, "test_error_01": final_test_error_01,
+        "train_mse": final_train_mse,
+        "test_mse": final_test_mse,
+        "train_error_01": final_train_error_01,
+        "test_error_01": final_test_error_01,
+        "kappa_nominal": kappa_nominal,
+        "T_nominal": T_nominal,
+        "kappa_eff_sq_median": kappa_eff_sq_median,
+        "kappa_eff_median": kappa_eff_median,
+        "kappa_eff_valid_frac": valid_frac,
     }
 
 
@@ -239,7 +302,6 @@ def save_result(result, json_path):
 
 def worker(rank, world_size, job_queue, hyperparams, base_save_dir):
     """The main worker function for each GPU process."""
-    # H100-friendly settings
     torch.set_float32_matmul_precision('high')
     torch.backends.cuda.matmul.allow_tf32 = True
 
@@ -257,23 +319,19 @@ def worker(rank, world_size, job_queue, hyperparams, base_save_dir):
         d = current_config['d']
         k = current_config['k']
         exp_id = current_config['exp_id']
-        eta = current_config['eta']
 
-        # Per-(d,k) test set for this job (keeps memory bounded)
         X_test, y_test = generate_k_sparse_parity_data(
             hyperparams['P_test'], d, k, device=device
         )
 
-        # Seed per exp for different inits (and different data draws)
+        # Seed per exp for different inits/data draws
         if 'base_seed' in hyperparams and hyperparams['base_seed'] is not None:
             seed = int(hyperparams['base_seed'] + exp_id + 1315423911 * (d + 1) + 2654435761 * (k + 1))
             torch.manual_seed(seed)
             torch.cuda.manual_seed_all(seed)
             np.random.seed(seed % (2**32 - 1))
 
-        X_train, y_train = generate_k_sparse_parity_data(
-            P_train, d, k, device=device
-        )
+        X_train, y_train = generate_k_sparse_parity_data(P_train, d, k, device=device)
 
         model = TwoLayerNet(
             d=d, N=hyperparams['N'], g_w=hyperparams['g_w'],
@@ -284,11 +342,11 @@ def worker(rank, world_size, job_queue, hyperparams, base_save_dir):
         initial_w = model.w.detach().clone()
         initial_a = model.a.detach().clone()
 
-        # Aggressive compile for H100
+        # Compile
         model = torch.compile(model, mode="max-autotune", fullgraph=True)
         uncompiled_model = model._orig_mod if hasattr(model, '_orig_mod') else model
 
-        final_errors = train_with_langevin(
+        final_metrics = train_with_langevin(
             model, X_train, y_train, X_test, y_test, hyperparams, current_config, rank
         )
 
@@ -296,27 +354,28 @@ def worker(rank, world_size, job_queue, hyperparams, base_save_dir):
         final_w = uncompiled_model.w.detach().clone()
         final_a = uncompiled_model.a.detach().clone()
 
-        # Directory structure includes d and k (JSON includes all grid params, including eta)
+        # Directory structure includes d and k
         save_dir = base_save_dir / f"d{d}_k{k}"
         save_dir.mkdir(exist_ok=True, parents=True)
 
-        # Save weight distribution plot (include eta in filename to avoid collisions)
+        # Save weight distribution plot
         plots_dir = save_dir / "weight_distributions"
         plots_dir.mkdir(exist_ok=True)
-        plot_filename = f"weights_P_{P_train}_d_{d}_k_{k}_exp_{exp_id}_kappa_{kappa_0:.6f}_eta_{eta:.6e}.png"
+        plot_filename = f"weights_P_{P_train}_d_{d}_k_{k}_exp_{exp_id}_kappa_{kappa_0:.6f}.png"
         plot_path = plots_dir / plot_filename
-        plot_and_save_weights(initial_w, final_w, initial_a, final_a, P_train, d, k, exp_id, kappa_0, eta, plot_path)
+        plot_and_save_weights(initial_w, final_w, initial_a, final_a, P_train, d, k, exp_id, kappa_0, plot_path)
 
-        # Save results (json per (d,k) directory)
+        # Save results
         json_path = save_dir / "training_results.json"
         full_result = {
-            **current_config,  # includes P, kappa_0, d, k, exp_id, eta
-            **final_errors,
+            **current_config,
+            **final_metrics,
             "gpu": rank,
             "N": hyperparams['N'],
             "g_w": hyperparams['g_w'],
             "g_a": hyperparams['g_a'],
             "gamma_scaling_exponent": hyperparams['gamma_scaling_exponent'],
+            "eta": hyperparams['eta'],
             "epochs": hyperparams['epochs'],
             "batch_size": hyperparams['batch_size'],
             "P_test": hyperparams['P_test'],
@@ -328,7 +387,6 @@ def worker(rank, world_size, job_queue, hyperparams, base_save_dir):
 
 def main():
     """Main function to set up and run the distributed experiment."""
-    # --- Hyperparameters (fixed across jobs) ---
     hyperparams = {
         # Model / data params
         "N": 1024,
@@ -336,40 +394,42 @@ def main():
         "g_a": 1.0,
         "gamma_scaling_exponent": 1.0,
 
-        # Training params (job-specific 'eta' is handled via eta_values below)
-        "epochs": 15_000_000,
-        "log_interval": 50_000,
+        # Training params
+        "eta": 5e-6,
+        "epochs": 80_000_000,
+        "log_interval": 10_000,
         "P_test": 100_000,
         "batch_size": 200_000,
-        "early_stop_loss": 1e-20,  #0.05,
-        "early_stop_error": 1e-20,  #0.001,
+        "early_stop_loss": 0.05,
+        "early_stop_error": 0.001,
 
-        # Number of runs per unique (d, k, P, kappa_0, eta)
+        # κ_eff diagnostic controls
+        "temp_ema_beta": 0.9,
+        "temp_eps_var": 1e-12,
+        "sigma_phi2_min": 0.0,   # set >0 (e.g., 1e-4) to ignore dead ReLUs
+
+        # Number of runs per unique (d, k, P, kappa_0)
         "num_exp": 1,
 
-        # Optional: set to an int for reproducible families of runs, or None for random
+        # Seed
         "base_seed": 12345,
     }
 
-    # --- Save directory (make sure this path exists on your system) ---
-    base_save_dir = Path("/home/goring/mean_field_langevin/Langevin_training/results/d25_k4_2108_grid")
+    base_save_dir = Path("/home/goring/mean_field_langevin/Langevin_training/results/d40_k4_eta5e-6_2")
     base_save_dir.mkdir(exist_ok=True, parents=True)
 
-    # --- Experiment Grids ---
-    d_values = [25]
+    # Experiment grids
+    d_values = [40]
     k_values = [4]
-    P_values = [10,100,250,500,750,1000,1500,2000,2500]
-    kappa_0_values = [1e-3,1e-2] #np.logspace(np.log10(1e-4), np.log10(5e1), 15)  # <-- adjust as desired; can also use logspace
-    # Make learning rate iterable:
-    eta_values = [2.5e-4]  # <-- adjust as desired; can also use logspace
+    P_values = [50_000]
+    kappa_0_values = np.logspace(np.log10(1e-4), np.log10(5e1), 14)
 
-    # Save the hyperparameters
+    # Save hyperparams
     with open(base_save_dir / "hyperparameters.json", 'w') as f:
         json.dump(hyperparams, f, indent=4)
 
-    # Build a set of completed jobs (across all d,k) to resume safely
+    # Resume support: collect completed jobs
     completed_jobs = set()
-    # Search all subdirs d*/k* for their training_results.json
     for d in d_values:
         for k in k_values:
             json_path = base_save_dir / f"d{d}_k{k}" / "training_results.json"
@@ -378,35 +438,29 @@ def main():
                     with open(json_path, 'r') as f:
                         results = json.load(f)
                     for r in results:
-                        # Ensure keys exist before adding to set; use tolerant float formatting for kappa_0 and eta
-                        required = ['P', 'kappa_0', 'd', 'k', 'exp_id', 'eta']
-                        if all(key in r for key in required):
-                            completed_jobs.add(
-                                (r['P'], f"{r['kappa_0']:.8f}", r['d'], r['k'], r['exp_id'], f"{r['eta']:.8e}")
-                            )
+                        if all(key in r for key in ['P', 'kappa_0', 'd', 'k', 'exp_id']):
+                            completed_jobs.add((r['P'], f"{r['kappa_0']:.8f}", r['d'], r['k'], r['exp_id']))
                 except json.JSONDecodeError:
                     print(f"Warning: Could not decode existing results for d={d}, k={k}. Continuing.")
 
-    # Create job queue including d, k, exp_id, and eta
+    # Create job queue
     job_queue = mp.Queue()
     job_count = 0
     for d in d_values:
         for k in k_values:
             for P in P_values:
                 for k0 in kappa_0_values:
-                    for eta in eta_values:
-                        for exp_id in range(hyperparams['num_exp']):
-                            key = (P, f"{k0:.8f}", d, k, exp_id, f"{eta:.8e}")
-                            if key not in completed_jobs:
-                                job_queue.put({
-                                    "P": int(P),
-                                    "kappa_0": float(k0),
-                                    "d": int(d),
-                                    "k": int(k),
-                                    "exp_id": int(exp_id),
-                                    "eta": float(eta),
-                                })
-                                job_count += 1
+                    for exp_id in range(hyperparams['num_exp']):
+                        key = (P, f"{k0:.8f}", d, k, exp_id)
+                        if key not in completed_jobs:
+                            job_queue.put({
+                                "P": P,
+                                "kappa_0": float(k0),
+                                "d": int(d),
+                                "k": int(k),
+                                "exp_id": int(exp_id),
+                            })
+                            job_count += 1
 
     if job_count == 0:
         print("All experiments already completed. Exiting.")
@@ -420,18 +474,13 @@ def main():
         return
 
     print(f"Found {world_size} GPUs. Starting workers...")
-
-    # Robust start method for CUDA multiprocessing
     mp.spawn(worker, args=(world_size, job_queue, hyperparams, base_save_dir), nprocs=world_size, join=True)
-
     print("\n--- All jobs completed ---")
 
 
 if __name__ == '__main__':
     try:
-        # 'spawn' is a robust start method, good for CUDA applications
         mp.set_start_method('spawn', force=True)
     except RuntimeError:
-        print("Multiprocessing start method already set.")
         pass
     main()
