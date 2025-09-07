@@ -11,6 +11,7 @@ import torch.multiprocessing as mp
 from filelock import FileLock
 from torch.cuda.amp import autocast
 import queue as pyqueue  # for Empty exception in mp.Queue
+from torch.amp import autocast
 
 # -----------------------------
 # Data
@@ -54,7 +55,21 @@ class TwoLayerNet(nn.Module):
         return (self.phi(x @ self.w) @ self.a) / (self.N ** self.gamma)
 
 # -----------------------------
-# Custom Optimizer (SGLD/Langevin-GD)
+# LR schedule helper
+# -----------------------------
+def poly_decay_lr(epoch: int, eta_start: float, eta_final: float,
+                  decay_steps: int, power: float = 2.0) -> float:
+    """
+    Polynomial decay from eta_start to eta_final over 'decay_steps' steps.
+    Holds at eta_final afterwards.
+    """
+    if decay_steps <= 0:
+        return eta_final
+    tau = min(1.0, epoch / float(decay_steps))
+    return eta_final + (eta_start - eta_final) * (1.0 - tau) ** power
+
+# -----------------------------
+# Custom Optimizer (SGLD/Langevin-GD) with foreach updates
 # -----------------------------
 class LangevinGD(torch.optim.Optimizer):
     """
@@ -75,31 +90,44 @@ class LangevinGD(torch.optim.Optimizer):
                 loss = closure()
 
         for group in self.param_groups:
-            lr = group['lr']
-            T = group['T']
+            lr = float(group['lr'])
+            T = float(group['T'])
             sigma_sq = group.get('sigma_sq', None)
             if sigma_sq is None:
                 raise ValueError("Each param group must have 'sigma_sq' set.")
 
-            for p in group['params']:
-                if p.grad is None:
-                    continue
-                decay = (T / sigma_sq) * p
-                noise = torch.randn_like(p) * math.sqrt(2.0 * T * lr)
-                p.add_(-lr * (decay + p.grad) + noise)
+            # collect tensors that have grads
+            ps = [p for p in group['params'] if p.grad is not None]
+            if not ps:
+                continue
+
+            # decay = (T/sigma_sq) * p  (computed elementwise per param)
+            decay_coeff = T / float(sigma_sq)
+            decays = [p.mul(decay_coeff) for p in ps]
+
+            # -lr * (decay + grad)
+            drift_updates = [-(lr) * (d + p.grad) for p, d in zip(ps, decays)]
+
+            # sqrt(2*T*lr) * N(0, I)  -- generate in fp32 then cast to param dtype
+            noise_std = math.sqrt(2.0 * T * lr)
+            noises = [torch.randn_like(p, dtype=torch.float32).mul_(noise_std).to(p.dtype) for p in ps]
+
+            # combined updates: drift + noise
+            updates = [du + nz for du, nz in zip(drift_updates, noises)]
+
+            # foreach fused add
+            torch._foreach_add_(ps, updates)
 
         return loss
 
-
 def _cavity_constants(y_pred: torch.Tensor, y_true: torch.Tensor):
-        yp = y_pred.to(torch.float32)
-        yt = y_true.to(torch.float32)
-        m_S = (yp * yt).mean().item()
-        r = yp - m_S * yt
-        noise_norm2 = (r * r).mean().item()
-        err01_direct = (torch.sign(yp) != yt).float().mean().item()
-        return m_S, noise_norm2, err01_direct
-
+    yp = y_pred.to(torch.float32)
+    yt = y_true.to(torch.float32)
+    m_S = (yp * yt).mean().item()
+    r = yp - m_S * yt
+    noise_norm2 = (r * r).mean().item()
+    err01_direct = (torch.sign(yp) != yt).float().mean().item()
+    return m_S, noise_norm2, err01_direct
 
 # -----------------------------
 # JSON Utils
@@ -139,15 +167,24 @@ def train_with_langevin(model, X_train, y_train, X_test, y_test, hyperparams, cu
     Trains using Langevin GD.
     - If use_full_batch: single forward/backward per epoch over entire training set.
     - Else: mini-batch SGLD.
-    Early stopping: when test 0-1 error < 1e-3, continue for +500k epochs then stop.
+
+    Early stopping:
+      * Default (unchanged): trigger when test MSE < 0.03, then continue +100k epochs and stop.
+      * NEW SWITCH: if (P_train <= hyperparams['train_error_switch_P_below']) OR
+                    (kappa_0 >= hyperparams['train_error_switch_kappa_above']),
+                    trigger when TRAIN 0-1 error <= 0.01, then continue +100k epochs and stop.
     """
     epochs = hyperparams['epochs']
     log_interval = hyperparams['log_interval']
     batch_size = hyperparams['batch_size']
 
-    eta = float(current_config['eta'])
-    P_train = int(X_train.shape[0])
+    # Final LR from grid (backwards compat), start LR from config or default to final
+    eta_final = float(current_config['eta'])
+    eta_start = float(current_config.get('eta_start', eta_final))
+    lr_decay_steps = int(hyperparams.get('lr_decay_steps', 0))
+    lr_power = float(hyperparams.get('lr_power', 2.0))
 
+    P_train = int(X_train.shape[0])
     N = model.N
     sigma_a = float(model.sigma_a)
     sigma_w = float(model.sigma_w)
@@ -171,31 +208,51 @@ def train_with_langevin(model, X_train, y_train, X_test, y_test, hyperparams, cu
             {'params': [model.a], 'sigma_sq': sigma_a ** 2},
             {'params': [model.w], 'sigma_sq': sigma_w ** 2},
         ],
-        lr=eta,
+        lr=eta_start,  # will be overwritten each epoch by schedule
         T=T,
     )
 
+    # -----------------------------
+    # NEW: Decide early-stop mode based on thresholds
+    # -----------------------------
+    P_switch = hyperparams.get('train_error_switch_P_below', None)
+    kappa_switch = hyperparams.get('train_error_switch_kappa_above', None)
+    use_train_error_switch = (
+        (P_switch is not None and P_train <= int(P_switch)) or
+        (kappa_switch is not None and kappa_0 >= float(kappa_switch))
+    )
+    TRAIN_ERR_TARGET = 0.01  # as requested
+
+    early_stop_mode_str = "train_err<=0.01" if use_train_error_switch else "test_mse<0.03"
+
     print(f"[GPU {device}] Start (bf16): P={P_train}, d={d}, k={k}, exp={exp_id}, "
-          f"N={N}, gamma={gamma_scaling_exponent}, k0={kappa_0:.3e}, eta={eta:.2e}, T={T:.4e}, "
-          f"full_batch={use_full_batch}")
+          f"N={N}, gamma={gamma_scaling_exponent}, k0={kappa_0:.3e}, "
+          f"eta0={eta_start:.2e}, etaf={eta_final:.2e}, T={T:.4e}, "
+          f"full_batch={use_full_batch}, decay_steps={lr_decay_steps}, p={lr_power}, "
+          f"early_stop={early_stop_mode_str}")
 
     start_time = time.time()
     epochs_run = 0
     stop_after_epoch = None
     stopped_early = False
 
-    with torch.inference_mode():
-        with autocast(dtype=torch.bfloat16):
+    with torch.no_grad():
+        with autocast("cuda", dtype=torch.bfloat16):
             y_pred_test0 = model(X_test)
     init_eval_mS, init_eval_noise_norm2, init_eval_err01_direct = _cavity_constants(y_pred_test0, y_test)
 
     # training loop
     for epoch in range(epochs + 1):
+        # schedule the LR
+        lr_t = poly_decay_lr(epoch, eta_start, eta_final, lr_decay_steps, lr_power)
+        for g in optimizer.param_groups:
+            g['lr'] = lr_t
+
         model.train()
 
         if use_full_batch:
             optimizer.zero_grad(set_to_none=True)
-            with autocast(dtype=torch.bfloat16):
+            with autocast("cuda", dtype=torch.bfloat16):
                 y_pred_train = model(X_train)
                 train_loss_mean = loss_fn(y_pred_train, y_train)
             train_loss_mean.backward()
@@ -214,7 +271,7 @@ def train_with_langevin(model, X_train, y_train, X_test, y_test, hyperparams, cu
                 yb = y_train[i:i + batch_size]
 
                 optimizer.zero_grad(set_to_none=True)
-                with autocast(dtype=torch.bfloat16):
+                with autocast("cuda", dtype=torch.bfloat16):
                     yb_pred = model(xb)
                     batch_loss_mean = loss_fn(yb_pred, yb)
                 batch_loss_mean.backward()
@@ -230,17 +287,17 @@ def train_with_langevin(model, X_train, y_train, X_test, y_test, hyperparams, cu
         if epoch % log_interval == 0:
             model.eval()
             with torch.no_grad():
-                with autocast(dtype=torch.bfloat16):
+                with autocast("cuda", dtype=torch.bfloat16):
                     y_pred_test = model(X_test)
                 test_mse = loss_fn(y_pred_test, y_test).item()
                 test_error_01 = (torch.sign(y_pred_test) != y_test).float().mean().item()
 
             elapsed = time.time() - start_time
             print(f"[GPU {device}] P={P_train}, d={d}, k={k}, exp={exp_id}, "
-                  f"gamma={gamma_scaling_exponent}, k0={kappa_0:.3e}, eta={eta:.2e} | "
+                  f"gamma={gamma_scaling_exponent}, k0={kappa_0:.3e}, eta_now={lr_t:.2e} | "
                   f"Ep {epoch:>7} | Train MSE: {train_mse:.6f} | Test MSE: {test_mse:.6f} | "
                   f"Train Err: {train_error_01:.6f} | Test Err: {test_error_01:.6f} | "
-                  f"T={T:.4e} | Time: {elapsed:.1f}s")
+                  f"T={T:.4e} | Time: {elapsed:.1f}s | ES:{early_stop_mode_str}")
 
             if np.isnan(train_mse) or np.isnan(test_mse):
                 print(f"[GPU {device}] NaN detected. Stopping.")
@@ -248,11 +305,21 @@ def train_with_langevin(model, X_train, y_train, X_test, y_test, hyperparams, cu
                 epochs_run = epoch
                 break
 
-            # Early stopping trigger (as before): if test err dips below 1e-3, train +500k epochs then stop
-            if stop_after_epoch is None and test_mse < 0.01:
-                stop_after_epoch = epoch + 250_000
-                print(f"[GPU {device}] Early-stop trigger hit: test err {test_mse:.3e}. "
-                      f"Continuing until epoch {stop_after_epoch}.")
+            # -----------------------------
+            # NEW: Early stopping trigger (mode-dependent)
+            # -----------------------------
+            if stop_after_epoch is None:
+                if use_train_error_switch:
+                    if train_error_01 <= TRAIN_ERR_TARGET:
+                        stop_after_epoch = epoch + 100_000
+                        print(f"[GPU {device}] Early-stop trigger hit (train err <= {TRAIN_ERR_TARGET:.3f}). "
+                              f"Continuing until epoch {stop_after_epoch}.")
+                else:
+                    # Original behavior: use test MSE threshold
+                    if test_mse < 0.03:
+                        stop_after_epoch = epoch + 100_000
+                        print(f"[GPU {device}] Early-stop trigger hit (test MSE {test_mse:.3e}). "
+                              f"Continuing until epoch {stop_after_epoch}.")
 
             if stop_after_epoch is not None and epoch >= stop_after_epoch:
                 stopped_early = True
@@ -265,18 +332,19 @@ def train_with_langevin(model, X_train, y_train, X_test, y_test, hyperparams, cu
     # Final evaluation
     model.eval()
     with torch.no_grad():
-        with autocast(dtype=torch.bfloat16):
-            y_pred_train_final = model(X_train)
-            y_pred_test_final = model(X_test)
+        with autocast("cuda", dtype=torch.bfloat16):
+            y_pred_train_final = model(X_train).clone()  # <-- clone here
+            y_pred_test_final  = model(X_test)
         final_train_mse = loss_fn(y_pred_train_final, y_train).item()
-        final_test_mse = loss_fn(y_pred_test_final, y_test).item()
+        final_test_mse  = loss_fn(y_pred_test_final,  y_test ).item()
+
         final_train_error_01 = (torch.sign(y_pred_train_final) != y_train).float().mean().item()
         final_test_error_01 = (torch.sign(y_pred_test_final) != y_test).float().mean().item()
         final_eval_mS, final_eval_noise_norm2, final_eval_err01_direct = _cavity_constants(y_pred_test_final, y_test)
 
     print(f"[GPU {device}] Finished: P={P_train}, d={d}, k={k}, exp={exp_id}, "
-          f"gamma={gamma_scaling_exponent}, k0={kappa_0:.3e}, eta={eta:.2e}, "
-          f"epochs_run={epochs_run}, stopped_early={stopped_early}")
+          f"gamma={gamma_scaling_exponent}, k0={kappa_0:.3e}, eta0={eta_start:.2e}, etaf={eta_final:.2e}, "
+          f"epochs_run={epochs_run}, stopped_early={stopped_early}, early_stop={early_stop_mode_str}")
 
     return {
         "train_mse": final_train_mse,
@@ -292,7 +360,14 @@ def train_with_langevin(model, X_train, y_train, X_test, y_test, hyperparams, cu
         "final_eval_mS": final_eval_mS,
         "final_eval_noise_norm2": final_eval_noise_norm2,
         "final_eval_err01_direct": final_eval_err01_direct,
-     }
+        # LR schedule info
+        "eta_start": eta_start,
+        "eta_final": eta_final,
+        "lr_decay_steps": lr_decay_steps,
+        "lr_power": lr_power,
+        # NEW: record which early-stop mode was active
+        "early_stop_mode": early_stop_mode_str,
+    }
 
 # -----------------------------
 # Worker (no pruning/skip logic)
@@ -330,7 +405,8 @@ def worker(global_rank,
         d = int(current_config['d'])
         k = int(current_config['k'])
         exp_id = int(current_config['exp_id'])
-        eta = float(current_config['eta'])
+        eta_final = float(current_config['eta'])
+        eta_start = float(current_config.get('eta_start', eta_final))
         gamma_scaling_exponent = float(current_config['gamma_scaling_exponent'])
 
         # Build per-(d,k) test set for this job
@@ -349,8 +425,12 @@ def worker(global_rank,
             d=d, N=hyperparams['N'], g_w=hyperparams['g_w'],
             g_a=hyperparams['g_a'], gamma_scaling_exponent=gamma_scaling_exponent
         ).to(device)
-        model = torch.compile(model, mode='max-autotune')
 
+        # compile the model (no logic change)
+        #try:
+        model = torch.compile(model, mode='max-autotune')
+        #except Exception as e:
+        #   print(f"[GPU {device}] torch.compile unavailable or failed: {e}. Proceeding without compile.")
 
         # -----------------------------
         # SAVE DIR + FILENAMES
@@ -361,7 +441,8 @@ def worker(global_rank,
         def smart_name(prefix):
             return (
                 f"{prefix}_P_{P_train}_d_{d}_k_{k}_exp_{exp_id}"
-                f"_kappa_{kappa_0:.6f}_eta_{eta:.6e}_gamma_{gamma_scaling_exponent:.6f}.pt"
+                f"_kappa_{kappa_0:.6f}_eta0_{eta_start:.6e}_etaf_{eta_final:.6e}"
+                f"_gamma_{gamma_scaling_exponent:.6f}.pt"
             )
 
         init_path = save_dir / smart_name("init_model")
@@ -421,22 +502,36 @@ def main():
         "g_a": 1.0,
 
         # Training params
-        "epochs": 5_000_000,
-        "log_interval": 100_000,
+        "epochs": 7_500_000,
+        "log_interval": 250_000,
         "P_test": 100_000,
         "batch_size": 200_000,   # full-batch triggers when P_train <= batch_size
         "early_stop_loss": 1e-20,    # kept for JSON continuity
         "early_stop_error": 1e-20,   # kept for JSON continuity
+
+        # LR schedule knobs
+        "lr_decay_steps": 2_000_000,  # try 300_000 (aggressive) or 2_000_000 (conservative)
+        "lr_power": 2.0,
 
         # Number of runs per unique (d, k, P, kappa_0, eta, gamma)
         "num_exp": 3,
 
         # Optional seed family
         "base_seed": 12345,
+
+        # -----------------------------
+        # NEW: Early-stop switching thresholds
+        # Switch to TRAIN 0-1 error <= 0.01 when:
+        #   (P_train <= train_error_switch_P_below) OR
+        #   (kappa_0  >= train_error_switch_kappa_above)
+        # Set to None to disable either condition.
+        # -----------------------------
+        "train_error_switch_P_below": 550,     # example: small-P jobs use train-error early stop
+        "train_error_switch_kappa_above": 0.02, # example: large-kappa jobs use train-error early stop
     }
 
     # --- Save directory ---
-    base_save_dir = Path("/home/goring/mean_field_langevin/MCMC_composite/results_d35k4hm/ard_no1N_7.5e-3+")
+    base_save_dir = Path("/home/goring/mean_field_langevin/Langevin_training/results_paper1/d35_k4_lrdecay")
     base_save_dir.mkdir(exist_ok=True, parents=True)
 
     # --- Experiment Grids (ORDER MATTERS) ---
@@ -444,18 +539,20 @@ def main():
     k_values = [4]
 
     # P descending (start from largest P)
-    P_values = [750]# [10, 100, 500, 750, 1000, 2133, 3666, 5000, 7500, 10000]
-    P_values = sorted(P_values, reverse=True)  # descending
+    P_values = [10, 100, 500, 750, 1000, 2133, 3666, 5000, 7500, 10000]  #
+    # P_values = sorted(P_values, reverse=True)  # descending
 
     # kappa ascending (start from smallest kappa)
-    kappa_0_values =  [7.5e-3]#[7.5e-3, 1e-2, 1e-1, 1e-3, 5e-3, 7.5e-2, 2.5e-2, 5e-2, 5e-4]
+    kappa_0_values = [7.5e-3, 1e-2, 1e-3, 5e-3, 7.5e-2, 2.5e-2, 5e-2, 5e-4]  # more: [7.5e-3, 1e-2, 1e-1, 1e-3, 5e-3, 7.5e-2, 2.5e-2, 5e-2, 5e-4]
     kappa_0_values = sorted(kappa_0_values)   # ascending
 
     # gamma values
     gamma_values = [0.5]
 
-    # LR grid
+    # LR grid (FINAL values)
     eta_values = [5e-4]
+    # starting LR
+    eta_start = 1e-3
 
     # Save hyperparams snapshot (+ the grids we sweep)
     snapshot = dict(hyperparams)
@@ -463,7 +560,8 @@ def main():
         "P_values_desc": P_values,
         "kappa_0_values_asc": kappa_0_values,
         "gamma_values": gamma_values,
-        "eta_values": eta_values,
+        "eta_values_final": eta_values,
+        "eta_start": eta_start,
         "d_values": d_values,
         "k_values": k_values,
     })
@@ -501,7 +599,7 @@ def main():
             for gamma in gamma_values:
                 for k0 in kappa_0_values:           # kappa ascending outer loop
                     for P in P_values:               # P descending inner loop
-                        for eta in eta_values:
+                        for eta in eta_values:       # FINAL LR
                             for exp_id in range(hyperparams['num_exp']):
                                 key = (int(P),
                                        f"{float(k0):.8f}",
@@ -516,7 +614,8 @@ def main():
                                         "d": int(d),
                                         "k": int(k),
                                         "exp_id": int(exp_id),
-                                        "eta": float(eta),
+                                        "eta": float(eta),             # FINAL lr
+                                        "eta_start": float(eta_start), # START lr
                                         "gamma_scaling_exponent": float(gamma),
                                     })
                                     job_count += 1
@@ -533,7 +632,7 @@ def main():
         return
     print(f"Found {num_gpus} GPU(s).")
 
-    # --- 3 workers/GPU ---
+    # --- 2 workers/GPU (as requested) ---
     per_gpu_workers = 2
     nprocs = num_gpus * per_gpu_workers
     print(f"Launching {nprocs} workers ({per_gpu_workers} per GPU).")

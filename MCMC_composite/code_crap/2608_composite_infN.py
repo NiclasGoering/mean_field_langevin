@@ -8,7 +8,7 @@
 # Key fixes retained from your previous version:
 #   (1) Mean prediction ⟨f(x)⟩ = N * E_b[c(w_b) φ(w_b^T x)]   [c already includes N^{-γ}]
 #   (2) Susceptibility scale: χ_AA = (N/κ^2) E_b[ E[a^2|w_b] * J_A(w_b)^2 ]
-#   (3) All "1/(2 σ_a^2)" factors implemented in α, and consistent β, μ, σ^2
+#   (3) All "1/( σ_a^2)" factors implemented in α, and consistent β, μ, σ^2
 #   (4) Prior over w uses variance σ_w^2 / d  ⇒ S_prior(w) = d ||w||^2 / (2 σ_w^2)
 #   (5) Comments at every formula implementation
 
@@ -152,14 +152,14 @@ def sgld_sample_w(
         Jr     := JY - Jm
 
     FORMULAS (your final corrected ones):
-      α(w)  = 1/(2 σ_a^2) + Σ(w) / (κ^2 N^{2γ})                  [Eq. α]
+      α(w)  = 1/( σ_a^2) + Σ(w) / (κ^2 N^{2γ})                  [Eq. α]
       β(w)  = Jr / (κ^2 N^{γ})                                   [Eq. β]
       μ(w)  = β/α                                                [posterior mean of a | w]
       σ^2(w)= 1/α                                                [posterior var of a | w]
 
       S_eff(w) = (d / (2 σ_w^2)) ||w||^2 + 0.5 * log α - 0.5 * β^2 / α   [+ const]
       c(w)  = μ / N^{γ} = Jr / (κ^2 N^{2γ} α) = Jr / D_oracle
-      D_oracle(w) = κ^2 N^{2γ} α = κ^2 N^{2γ} * (1/(2 σ_a^2)) + Σ(w)
+      D_oracle(w) = κ^2 N^{2γ} α = κ^2 N^{2γ} * (1/( σ_a^2)) + Σ(w)
     """
     device = w.device
     P = X.shape[0]
@@ -172,10 +172,10 @@ def sgld_sample_w(
     var_w_per_coord = (mdl.sigma_w ** 2) / mdl.d
 
     # Acoef implements 1/(2 σ_a^2)  [matches α's first term]
-    Acoef = 1.0 / (2.0 * (mdl.sigma_a ** 2))
+    Acoef = 1.0 / (  (mdl.sigma_a ** 2))
 
-    stiff = (kappa**4) * (mdl.N ** (2.0*mdl.gamma))
-    step = mcmc.step_size * max(stiff, 1e-12)
+    #stiff = (kappa**4) * (mdl.N ** (2.0*mdl.gamma))
+    step = mcmc.step_size #* max(stiff, 1e-12)
     #step = mcmc.step_size
     autocast_enabled = mcmc.autocast if (mcmc.autocast is not None) else w.is_cuda
 
@@ -195,7 +195,7 @@ def sgld_sample_w(
         Jm    = (g.t() @ m_f) / float(P)       # (B,)
         Jr    = JY - Jm                         # Jr(w) = JY - Jm
 
-        # α(w) = 1/(2 σ_a^2) + Σ / (κ^2 N^{2γ})
+        # α(w) = 1/( σ_a^2) + Σ / (κ^2 N^{2γ})
         D_internal = (Acoef + Sigma / (kappa * kappa * N2g)).clamp_min(1e-12)   # α(w)
 
         # Prior term: d ||w||^2 / (2 σ_w^2)  == 0.5 * ||w||^2 / (σ_w^2 / d)
@@ -213,6 +213,9 @@ def sgld_sample_w(
         # Langevin step on w
         grad = torch.autograd.grad(U.sum(), w, retain_graph=False, create_graph=False)[0]
         grad = torch.where(torch.isfinite(grad), grad, torch.zeros_like(grad))
+             # Exit the loop
+        #grad_norm = grad.norm().item()
+        #print(f"Step: {step:.4e}, Grad Norm: {grad_norm:.4f}")
         if mcmc.grad_clip and mcmc.grad_clip > 0:
             gn = grad.norm(dim=1, keepdim=True).clamp_min(1e-12)
             grad = grad * (mcmc.grad_clip / gn).clamp(max=1.0)
@@ -237,7 +240,7 @@ def sgld_sample_w(
     Jr    = JY - Jm
 
     # D_oracle = κ^2 N^{2γ} α  = κ^2 N^{2γ} * (1/(2 σ_a^2)) + Σ
-    D_oracle = ((kappa ** 2) * N2g * 1.0 / (2.0 * (mdl.sigma_a ** 2)) + Sigma).clamp_min(1e-12)
+    D_oracle = ((kappa ** 2) * N2g * 1.0 / (  (mdl.sigma_a ** 2)) + Sigma).clamp_min(1e-12)
 
     return (
         w.detach(),            # sampled weights
@@ -384,7 +387,7 @@ class FunctionalCavitySolver:
         t0 = time.time()
 
         # For logging: κ^2 N^{2γ} * (1/(2 σ_a^2))
-        Acoef = 1.0 / (2.0 * (self.mdl.sigma_a ** 2))
+        Acoef = 1.0 / (  (self.mdl.sigma_a ** 2))
         kappa2N2A = (self.kappa ** 2) * (self.mdl.N ** (2.0 * self.mdl.gamma)) * Acoef
 
         for it in range(1, outer_steps + 1):
@@ -586,27 +589,27 @@ if __name__ == "__main__":
     M_components = len(teacher_sets)
 
     # Fixed eval set (reused for all runs)
-    P_eval = 20000
+    P_eval = 10000
     X_eval,  y_eval,  _ = generate_composite_data(P_eval, d, teacher_sets, device)
 
     # ---- Model/MCMC/Solver knobs ----
-    N = 512
+    N = 512*2
 
     # Make gamma iterable — sweep over these values
     GAMMA_LIST = [0.5,1.0]  # e.g., [0.0, 0.25, 0.5, 0.75, 1.0]
 
     mcmc = MCMCParams(
-        B=8192, steps=400, step_size=800, step_decay=0.999,
-        grad_clip=1e8, clamp_w=20.0, autocast=True
+        B=1024*4, steps=1200, step_size=5e-5, step_decay=0.9999999,
+        grad_clip=0.0, clamp_w=0.0, autocast=False
     )
     sol  = SolveParams(
-        outer_steps=1000, saem_a0=0.2, saem_t0=100.0, saem_damping=3.0,
+        outer_steps=4000, saem_a0=0.2, saem_t0=80.0, saem_damping=0.5,
         print_every=10
     )
 
-    P_TRAIN_LIST = [5000] #[10, 100, 500, 750, 1000, 2500, 5000, 7500, 10000, 20000]
+    P_TRAIN_LIST = [2500] #[10, 100, 500, 750, 1000, 2500, 5000, 7500, 10000, 20000]
     # NOTE: fixed obvious typo '7-5e-2' -> '7.5e-2'
-    KAPPA_LIST   = [5e-4, 7.5e-3, 2.5e-2, 7.5e-2, 1e-2, 1e-1, 1e-3, 5e-3, 7.5e-2, 2.5e-2, 5e-2]
+    KAPPA_LIST   = [7.5e-3, 2.5e-2, 7.5e-2, 1e-2, 1e-1, 1e-3, 5e-3, 7.5e-2, 2.5e-2, 5e-2,5e-4]
 
     results_dir = "/home/goring/mean_field_langevin/MCMC_finiteP/resutls_mf1/d35_k4_biggrid"
     os.makedirs(results_dir, exist_ok=True)

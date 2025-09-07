@@ -547,9 +547,9 @@ if __name__ == "__main__":
 
     # ---- Sweep lists (edit here) ----
     P_TRAIN_LIST = [10, 100, 500, 750, 1000, 2500, 5000, 7500, 10000, 20000]     # training sizes
-    KAPPA_LIST   = [5e-4]             # noise levels
+    KAPPA_LIST   = [7.5e-3]             # noise levels
 
-    results_dir = "/home/goring/mean_field_langevin/MCMC_composite/results/2608_NNGP_d35_k4_1"
+    results_dir = "/home/goring/mean_field_langevin/MCMC_composite/results_NNGP/d35_k4_75e-3"
     os.makedirs(results_dir, exist_ok=True)
 
     # ---- Run sweep ----

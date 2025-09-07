@@ -92,14 +92,13 @@ class LangevinGD(torch.optim.Optimizer):
 
 
 def _cavity_constants(y_pred: torch.Tensor, y_true: torch.Tensor):
-        yp = y_pred.to(torch.float32)
-        yt = y_true.to(torch.float32)
-        m_S = (yp * yt).mean().item()
-        r = yp - m_S * yt
-        noise_norm2 = (r * r).mean().item()
-        err01_direct = (torch.sign(yp) != yt).float().mean().item()
-        return m_S, noise_norm2, err01_direct
-
+    yp = y_pred.to(torch.float32)
+    yt = y_true.to(torch.float32)
+    m_S = (yp * yt).mean().item()
+    r = yp - m_S * yt
+    noise_norm2 = (r * r).mean().item()
+    err01_direct = (torch.sign(yp) != yt).float().mean().item()
+    return m_S, noise_norm2, err01_direct
 
 # -----------------------------
 # JSON Utils
@@ -132,6 +131,59 @@ def is_success(train_err_01: float, test_err_01: float) -> bool:
     return (train_err_01 <= 1e-3) and (test_err_01 <= 0.25)
 
 # -----------------------------
+# ARD rho estimation (full-batch over training set)
+# -----------------------------
+@torch.no_grad()
+def estimate_rho_fullbatch(model: TwoLayerNet,
+                           X_train: torch.Tensor,
+                           T: float,
+                           kappa: float) -> torch.Tensor:
+    """
+    Computes rho_j for j=1..d using the full training set in one pass.
+
+    rho_j = 1/sigma_w^2 + (1/(T * kappa^2 * N^{2*gamma})) * sum_i a_i^2 * E_train[phi'(w_i^T x)^2 * x_j^2]
+
+    Returns: rho (d,) on CPU as float64 tensor for JSON-safe conversion.
+    """
+    device = X_train.device
+    d = model.d
+    N = model.N
+    gamma = model.gamma
+
+    # Prior precision term: 1 / sigma_w^2  (since sigma_w^2 = g_w / d)
+    prior_precision = 1.0 / (model.sigma_w ** 2)  # equals d / g_w
+
+    # Full-batch forward for preactivations
+    # Shapes: X_train (P,d), w (d,N) -> z (P,N)
+    # Work in float32 to avoid bfloat16 cast & to reduce memory.
+    Xf = X_train.to(torch.float32)
+    wf = model.w.to(torch.float32)
+    af = model.a.to(torch.float32).squeeze(1)  # (N,)
+
+    z = Xf @ wf  # (P, N)
+
+    # ReLU derivative: phi'(z) = 1_{z > 0}
+    dphi = (z > 0).to(torch.float32)  # (P, N)
+
+    # x_j^2
+    x_sq = Xf * Xf  # (P, d)
+
+    # E[phi'^2 * x_j^2] per (i,j): since phi'^2 = phi' for ReLU
+    # Compute E over training data in one matmul: (N,d) = (P,N)^T @ (P,d) / P
+    P = Xf.shape[0]
+    E_phi2_x2 = (dphi.T @ x_sq) / float(P)  # (N, d)
+
+    # Sum_i a_i^2 * E_{ij}
+    a_sq = (af * af).unsqueeze(1)  # (N,1)
+    weighted = a_sq * E_phi2_x2    # (N,d)
+    sum_over_i = weighted.sum(dim=0)  # (d,)
+
+    factor = 1.0 / (T * (kappa ** 2) * (N ** (2.0 * gamma)))  # scalar
+
+    rho = prior_precision + factor * sum_over_i  # broadcast prior to (d,)
+    return rho.to('cpu', dtype=torch.float64)
+
+# -----------------------------
 # Training (with conditional full-batch)
 # -----------------------------
 def train_with_langevin(model, X_train, y_train, X_test, y_test, hyperparams, current_config, device, use_full_batch):
@@ -140,6 +192,9 @@ def train_with_langevin(model, X_train, y_train, X_test, y_test, hyperparams, cu
     - If use_full_batch: single forward/backward per epoch over entire training set.
     - Else: mini-batch SGLD.
     Early stopping: when test 0-1 error < 1e-3, continue for +500k epochs then stop.
+
+    Additionally: every log_interval, compute full-batch ARD precisions rho_j over the training data
+    and store them in rho_traj (list of {epoch, rho}).
     """
     epochs = hyperparams['epochs']
     log_interval = hyperparams['log_interval']
@@ -184,7 +239,10 @@ def train_with_langevin(model, X_train, y_train, X_test, y_test, hyperparams, cu
     stop_after_epoch = None
     stopped_early = False
 
-    with torch.inference_mode():
+    # track rho trajectory for JSON
+    rho_traj = []
+
+    with torch.no_grad():
         with autocast(dtype=torch.bfloat16):
             y_pred_test0 = model(X_test)
     init_eval_mS, init_eval_noise_norm2, init_eval_err01_direct = _cavity_constants(y_pred_test0, y_test)
@@ -226,7 +284,7 @@ def train_with_langevin(model, X_train, y_train, X_test, y_test, hyperparams, cu
             train_mse = train_mse_sum / P_train
             train_error_01 = 1.0 - (train_correct_accum / P_train)
 
-        # Logging & early stopping (only at log_interval)
+        # Logging & rho estimation (only at log_interval)
         if epoch % log_interval == 0:
             model.eval()
             with torch.no_grad():
@@ -235,12 +293,20 @@ def train_with_langevin(model, X_train, y_train, X_test, y_test, hyperparams, cu
                 test_mse = loss_fn(y_pred_test, y_test).item()
                 test_error_01 = (torch.sign(y_pred_test) != y_test).float().mean().item()
 
+            # --- Full-batch ARD rho over entire training set ---
+            # (compute in fp32 without autocast for numerical clarity)
+            rho_vec = estimate_rho_fullbatch(model, X_train, T=T, kappa=kappa)  # (d,) cpu float64
+            rho_traj.append({
+                "epoch": int(epoch),
+                "rho": [float(r) for r in rho_vec.tolist()],  # JSON-friendly
+            })
+
             elapsed = time.time() - start_time
             print(f"[GPU {device}] P={P_train}, d={d}, k={k}, exp={exp_id}, "
                   f"gamma={gamma_scaling_exponent}, k0={kappa_0:.3e}, eta={eta:.2e} | "
                   f"Ep {epoch:>7} | Train MSE: {train_mse:.6f} | Test MSE: {test_mse:.6f} | "
                   f"Train Err: {train_error_01:.6f} | Test Err: {test_error_01:.6f} | "
-                  f"T={T:.4e} | Time: {elapsed:.1f}s")
+                  f"T={T:.4e} | Time: {elapsed:.1f}s | rho_min={rho_vec.min().item():.3e} rho_max={rho_vec.max().item():.3e}")
 
             if np.isnan(train_mse) or np.isnan(test_mse):
                 print(f"[GPU {device}] NaN detected. Stopping.")
@@ -249,9 +315,9 @@ def train_with_langevin(model, X_train, y_train, X_test, y_test, hyperparams, cu
                 break
 
             # Early stopping trigger (as before): if test err dips below 1e-3, train +500k epochs then stop
-            if stop_after_epoch is None and test_mse < 0.01:
-                stop_after_epoch = epoch + 250_000
-                print(f"[GPU {device}] Early-stop trigger hit: test err {test_mse:.3e}. "
+            if stop_after_epoch is None and test_error_01 < 1e-3:
+                stop_after_epoch = epoch + 250000
+                print(f"[GPU {device}] Early-stop trigger hit: test err {test_error_01:.3e}. "
                       f"Continuing until epoch {stop_after_epoch}.")
 
             if stop_after_epoch is not None and epoch >= stop_after_epoch:
@@ -292,6 +358,8 @@ def train_with_langevin(model, X_train, y_train, X_test, y_test, hyperparams, cu
         "final_eval_mS": final_eval_mS,
         "final_eval_noise_norm2": final_eval_noise_norm2,
         "final_eval_err01_direct": final_eval_err01_direct,
+        # ARD rho trajectory (every log_interval on full train set)
+        "rho_traj": rho_traj,
      }
 
 # -----------------------------
@@ -349,8 +417,6 @@ def worker(global_rank,
             d=d, N=hyperparams['N'], g_w=hyperparams['g_w'],
             g_a=hyperparams['g_a'], gamma_scaling_exponent=gamma_scaling_exponent
         ).to(device)
-        model = torch.compile(model, mode='max-autotune')
-
 
         # -----------------------------
         # SAVE DIR + FILENAMES
@@ -421,8 +487,8 @@ def main():
         "g_a": 1.0,
 
         # Training params
-        "epochs": 5_000_000,
-        "log_interval": 100_000,
+        "epochs": 10_000_000,
+        "log_interval": 50_000,
         "P_test": 100_000,
         "batch_size": 200_000,   # full-batch triggers when P_train <= batch_size
         "early_stop_loss": 1e-20,    # kept for JSON continuity
@@ -436,7 +502,7 @@ def main():
     }
 
     # --- Save directory ---
-    base_save_dir = Path("/home/goring/mean_field_langevin/MCMC_composite/results_d35k4hm/ard_no1N_7.5e-3+")
+    base_save_dir = Path("/home/goring/mean_field_langevin/Langevin_training/results_paper1/0309_d35_k4_rho_1")
     base_save_dir.mkdir(exist_ok=True, parents=True)
 
     # --- Experiment Grids (ORDER MATTERS) ---
@@ -444,11 +510,11 @@ def main():
     k_values = [4]
 
     # P descending (start from largest P)
-    P_values = [750]# [10, 100, 500, 750, 1000, 2133, 3666, 5000, 7500, 10000]
+    P_values = [10, 100, 500, 750, 1000, 2133, 3666, 5000, 7500, 10000]  # change as needed
     P_values = sorted(P_values, reverse=True)  # descending
 
     # kappa ascending (start from smallest kappa)
-    kappa_0_values =  [7.5e-3]#[7.5e-3, 1e-2, 1e-1, 1e-3, 5e-3, 7.5e-2, 2.5e-2, 5e-2, 5e-4]
+    kappa_0_values = [1e-3]
     kappa_0_values = sorted(kappa_0_values)   # ascending
 
     # gamma values
@@ -534,7 +600,7 @@ def main():
     print(f"Found {num_gpus} GPU(s).")
 
     # --- 3 workers/GPU ---
-    per_gpu_workers = 2
+    per_gpu_workers = 3
     nprocs = num_gpus * per_gpu_workers
     print(f"Launching {nprocs} workers ({per_gpu_workers} per GPU).")
 
