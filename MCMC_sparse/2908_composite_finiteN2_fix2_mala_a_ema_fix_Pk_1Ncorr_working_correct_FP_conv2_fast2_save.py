@@ -72,7 +72,7 @@ def generate_parity_multi(P: int, d: int, sets: List[torch.Tensor], E: int,
 class Model:
     d: int = 35
     B: int = 16384
-    N: int = 512          # f = N^{-γ} Σ a φ
+    N: int = 512          # f = (N^{1-γ}/B) * Σ a φ  == (1/N^γ) * Σ a φ if B=N
     gamma: float = 0.5
     sigma_a: float = 1.0
     sigma_w: float = 1.0
@@ -166,6 +166,11 @@ class RSCavityExplicitMulti:
         self.E = int(E)
         assert len(seeds_params) == E
 
+        # NEW: keep param seeds for snapshot metadata
+        self.param_seeds = list(seeds_params)
+        # NEW: record snapshot file paths
+        self._snapshots: Dict[str, Dict[str, str]] = {}
+
         # Temperature to match "code 2"
         self.T = 2.0 * (self.kappa ** 2)
 
@@ -186,6 +191,7 @@ class RSCavityExplicitMulti:
 
         # constants
         self.N_gamma = self.mdl.N ** self.mdl.gamma
+        # [FIX] unified mean-field scale valid for general B (matches Code 2 when B=N)
         self.scale_f = (self.mdl.N ** (1.0 - self.mdl.gamma)) / float(self.mdl.B)
 
         # fast matmuls
@@ -305,6 +311,10 @@ class RSCavityExplicitMulti:
         return torch.bmm(X, W.transpose(1, 2))
 
     def _scheduled_eta(self, it: int, P: int) -> float:
+        """
+        [FIX] Learning-rate schedule now explicitly matches Code 2's poly-decay (power=2):
+              η_t = η_end + (η_start - η_end) * (1 - min(t, K)/K)^2
+        """
         base = self.algo.step_size * (self.kappa**2 if self.algo.linear_kappa_step else 1.0)
         if self.algo.use_lr_decay and self.algo.lr_decay_iters > 0:
             lr0 = self.algo.lr_start if (self.algo.lr_start is not None) else base
@@ -335,20 +345,23 @@ class RSCavityExplicitMulti:
         Returns:
           grad_w_U, grad_a_U, optional f(x)
         Where:
-          ∇U = [ T * prior-gradient ] + [ data-gradient with mean MSE (1/P) ]
+          ∇U = [ T * prior-gradient ] + [ data-gradient with mean MSE (1/P) ]  # [FIX] matches PyTorch MSE (no 1/2)
         """
         Eexp, P, d = X.shape
         B = W.shape[1]
         invP = 1.0 / float(P)
 
         a_flat = a[:, :, 0]                 # (E,B)
-        a_over = a / self.N_gamma           # (E,B,1)
-        a_over_T = a_over.transpose(1, 2)   # (E,1,B)
+
+        # [FIX] Use unified scale s = (N^{1-γ}/B) consistently (general B), instead of 1/N^γ.
+        s = self.scale_f                    # scalar float
+        a_scaled = a * s                    # (E,B,1)
+        a_scaled_T = a_scaled.transpose(1, 2)   # (E,1,B)
 
         # preallocated accumulators
-        C1 = self._buf_C1.zero_()
-        C2 = self._buf_C2.zero_()
-        G  = self._buf_G.zero_()
+        C1 = self._buf_C1.zero_()           # (E,B)   accumulates Σ Φ^T r
+        C2 = self._buf_C2.zero_()           # (E,B)   accumulates Σ φ^2 per particle
+        G  = self._buf_G.zero_()            # (E,B,d) accumulates w-gradient
         f_acc = None
         if return_field:
             f_acc = torch.zeros(Eexp, P, device=self.device, dtype=self.dtype)
@@ -377,9 +390,10 @@ class RSCavityExplicitMulti:
                 C1 += torch.bmm(Phi.transpose(1, 2).contiguous(), rc).squeeze(-1)  # Σ Φ^T r
                 C2 += (Phi * Phi).sum(dim=1)                                      # Σ φ^2
 
-                # data gradient w.r.t. w (mean MSE: 1/P)
-                M = (rc - a_over_T * Phi) * dPhi * a_over_T
-                G += torch.bmm(M.transpose(1, 2).contiguous(), Xc) * (-invP)
+                # [FIX] Data gradient wrt w for mean MSE (1/P), with factor 2 and general-B scaling s
+                # M corresponds to (rc - s*Phi*a) * φ'(Z) * (s*a)
+                M = (rc - a_scaled_T * Phi) * dPhi * a_scaled_T                   # (E,n,B)
+                G += torch.bmm(M.transpose(1, 2).contiguous(), Xc) * (-2.0 * invP)
 
                 if return_field:
                     fa = torch.bmm(Phi, a)  # (E,n,1)
@@ -391,10 +405,12 @@ class RSCavityExplicitMulti:
 
         # ---- GRADIENTS OF U ----
         term1_a_priorU = (self.T / (self.mdl.sigma_a**2)) * a_flat
-        term2_a_dataU  = - C1 * (invP / self.N_gamma)
-        term3_a_dataU  = (C2 * (invP / (self.N_gamma**2))) * a_flat
+        # [FIX] mean MSE (1/P) => factor 2 in data terms; use s and s^2 (general B)
+        term2_a_dataU  = - 2.0 * C1 * (invP * s)
+        term3_a_dataU  = + 2.0 * (C2 * (invP * (s * s))) * a_flat
         grad_a_U  = (term1_a_priorU + term2_a_dataU + term3_a_dataU).unsqueeze(2).to(self.dtype)
 
+        # [unchanged] prior term for W still uses ARD precision ρ; data part already fixed above
         grad_w_U = (G + (self.T) * W * self.rho.unsqueeze(1)).to(self.dtype)
 
         # clip
@@ -421,6 +437,7 @@ class RSCavityExplicitMulti:
                 Z  = self._batched_mm_X_Wt(Xc, self.W.contiguous())
                 Phi = activation(Z, self.mdl.act)
                 fa = torch.bmm(Phi, self.a)
+                # [consistent] forward uses same general-B scale
                 f[:, start:start+n] = (self.scale_f * fa.squeeze(-1)).to(self.dtype)
         return f.unsqueeze(-1)
 
@@ -541,6 +558,143 @@ class RSCavityExplicitMulti:
         )
         return out
 
+    # ---------------- NEW: Snapshot helpers for p(W,a) ----------------
+
+    @torch.no_grad()
+    def _compute_empirical_stats(self, W: torch.Tensor, a: torch.Tensor) -> Dict[str, Any]:
+        """
+        Compute per-experiment summary stats over particles (dimension 1).
+        Inputs expected on CPU, float dtype.
+          W: (E,B,d)
+          a: (E,B,1)
+        Returns small float32 tensors.
+        """
+        # Ensure float (we'll cast to float32 on outputs)
+        W = W.float()
+        a = a.float()
+
+        E, B, d = W.shape
+
+        # Means over particles
+        w_mean = W.mean(dim=1)                 # (E,d)
+        a_mean = a.mean(dim=1)                 # (E,1)
+
+        # Centering
+        Wc = W - w_mean[:, None, :]            # (E,B,d)
+        ac = a - a_mean[:, None, :]            # (E,B,1)
+
+        # Cov(W) per experiment: (E,d,d)
+        w_cov = torch.zeros(E, d, d, dtype=torch.float32)
+        for e in range(E):
+            # (B,d) -> (d,d), population covariance (divide by B)
+            w_cov[e] = (Wc[e].T @ Wc[e]) / float(B)
+
+        # Var(a) per experiment: since a is scalar per particle, just the variance across B
+        a_var = (ac.squeeze(-1) ** 2).mean(dim=1, keepdim=True).to(torch.float32)  # (E,1)
+
+        # Cross-moment E[W_j * a] per experiment:
+        # broadcast a from (E,B,1) to (E,B,d), then average over B → (E,d)
+        wa_cross = (W * a.squeeze(-1)[:, :, None]).mean(dim=1).to(torch.float32)   # (E,d)
+
+        # Per-particle L2 then average (useful quick checks)
+        w_l2_mean = torch.linalg.vector_norm(W, dim=2).mean(dim=1, keepdim=True).to(torch.float32)  # (E,1)
+        a_l2_mean = torch.linalg.vector_norm(a, dim=2).mean(dim=1, keepdim=True).to(torch.float32)  # (E,1)
+
+        return {
+            "w_mean": w_mean.to(torch.float32),
+            "w_cov": w_cov,                 # already float32
+            "a_mean": a_mean.to(torch.float32),
+            "a_var": a_var,                 # float32
+            "wa_cross": wa_cross,           # float32 (E,d)
+            "w_l2_mean": w_l2_mean,         # float32
+            "a_l2_mean": a_l2_mean,         # float32
+        }
+
+
+    
+    @torch.no_grad()
+    def _save_particles(self,
+                        base_prefix: str,
+                        stage: str,
+                        stride: int = 1,
+                        to_dtype: Optional[torch.dtype] = torch.float32,
+                        save_npz: bool = True) -> Dict[str, str]:
+        """
+        Save an empirical sample of p(W,a) (raw particles + summary stats).
+        - base_prefix: filename stem (we'll append __{stage}_particles.*)
+        - stage: "init" or "final"
+        - stride: subsample particles along B (e.g., 2 saves every other particle)
+        - to_dtype: cast saved particles to this dtype (None keeps native)
+        - save_npz: also save a compressed NumPy mirror alongside the .pt
+        """
+        os.makedirs(os.path.dirname(base_prefix), exist_ok=True)
+
+        # Subsample & CPU move
+        W_cpu = self.W[:, ::stride, :].detach().to("cpu")
+        a_cpu = self.a[:, ::stride, :].detach().to("cpu")
+        rho_cpu = self.rho.detach().to("cpu")
+
+        if to_dtype is not None:
+            W_cpu = W_cpu.to(to_dtype)
+            a_cpu = a_cpu.to(to_dtype)
+
+        # Stats in float32
+        stats = self._compute_empirical_stats(W_cpu.float(), a_cpu.float())
+
+        # Metadata
+        meta = {
+            "stage": stage,
+            "time_unix": time.time(),
+            "E": int(self.E),
+            "B_saved": int(W_cpu.shape[1]),
+            "B_full": int(self.mdl.B),
+            "d": int(self.mdl.d),
+            "dtype_saved": str(W_cpu.dtype).replace("torch.", ""),
+            "scale_f": float(self.scale_f),
+            "kappa": float(self.kappa),
+            "T": float(self.T),
+            "device": str(self.device),
+            "model": dict(self.mdl.__dict__),
+            "algo": dict(self.algo.__dict__),
+            "ard": {
+                "use_ard": bool(self.ard.use_ard),
+                "alpha0": float(self.ard.alpha0),
+                "beta0": float(self.beta0),
+                "ema": float(self.ard.ema),
+                "rho_min": float(self.ard.rho_min),
+                "rho_max": float(self.ard.rho_max),
+            },
+            "param_seeds": self.param_seeds,
+        }
+
+        pkg = {
+            "params": {"W": W_cpu, "a": a_cpu, "rho": rho_cpu},
+            "stats": stats,
+            "meta": meta,
+        }
+
+        pt_path = f"{base_prefix}__{stage}_particles.pt"
+        torch.save(pkg, pt_path)
+
+        npz_path = ""
+        if save_npz:
+            npz = {
+                "W": W_cpu.numpy(),
+                "a": a_cpu.numpy(),
+                "rho": rho_cpu.numpy().astype(np.float32),
+                "w_mean": stats["w_mean"].numpy(),
+                "w_cov": stats["w_cov"].numpy(),
+                "a_mean": stats["a_mean"].numpy(),
+                "a_var": stats["a_var"].numpy(),
+                "wa_cross": stats["wa_cross"].numpy(),
+                "w_l2_mean": stats["w_l2_mean"].numpy(),
+                "a_l2_mean": stats["a_l2_mean"].numpy(),
+            }
+            npz_path = f"{base_prefix}__{stage}_particles.npz"
+            np.savez_compressed(npz_path, **npz)
+
+        return {"pt": pt_path, "npz": npz_path}
+
     # ---------------- Anderson acceleration ----------------
 
     @torch.no_grad()
@@ -581,7 +735,6 @@ class RSCavityExplicitMulti:
         dG = torch.stack(G_cols, dim=1)[:, 1:] - torch.stack(G_cols, dim=1)[:, :-1]  # [n, m]
 
         # Solve (dR^T dR + λI) * alpha = dR^T r_k
-        # alpha shape [m]
         lam = self.algo.aa_reg
         Gram = dR.T @ dR
         rhs  = dR.T @ r_k
@@ -625,7 +778,7 @@ class RSCavityExplicitMulti:
             "fp_residual": [], "fp_residual_per_exp": [],
             "rho_delta_rel": [],
             "eta": [], "K": [],
-            "test_mse_small": [],  # recorded at log steps
+            "test_mse_small": [],
         }
         t0 = time.time()
 
@@ -636,6 +789,13 @@ class RSCavityExplicitMulti:
             f"act{self.mdl.act}_{'f64' if self.algo.use_float64 else 'f32'}{('_'+dev_tag) if dev_tag else ''}.json"
         )
         save_path = os.path.join(out_dir, fname)
+
+        # NEW: base prefix for snapshot files (without extension)
+        base_prefix = os.path.splitext(save_path)[0]
+        # NEW: snapshot initial empirical p(W,a)
+        self._snapshots["init"] = self._save_particles(
+            base_prefix, stage="init", stride=1, to_dtype=torch.float32, save_npz=True
+        )
 
         # Early-stop counters & ARD trackers
         best_counter = 0
@@ -695,7 +855,6 @@ class RSCavityExplicitMulti:
             train_mse_mean = float(train_mse_per_e.mean().item())
 
             # -------- independent test-MSE early stop (IMMEDIATE) --------
-            # Uses the small eval set (labels precomputed) for speed.
             test_es_triggered = False
             test_mse_val = None
             if (
@@ -708,7 +867,6 @@ class RSCavityExplicitMulti:
                 f_eval_small = self._field_from_particles_stream(self._X_eval_small)
                 test_mse_val = float(((f_eval_small - self._y_eval_small.to(self.dtype))**2).mean().item())
                 if test_mse_val < self.algo.early_stop_test_mse_threshold:
-                    # Perform FULL EVAL once, save, and exit immediately.
                     self._ensure_full_eval_set()
                     ev = self._eval_on_X(self._X_eval_full)
                     rhomin = float(self.rho.min().item()); rhomax = float(self.rho.max().item())
@@ -757,11 +915,17 @@ class RSCavityExplicitMulti:
                             }
                         }
                     }
+
+                    # NEW: snapshot final before returning
+                    self._snapshots["final"] = self._save_particles(
+                        base_prefix, stage="final", stride=1, to_dtype=torch.float32, save_npz=True
+                    )
+                    payload["snapshots"] = self._snapshots
+
                     with open(save_path, "w") as f:
                         json.dump(payload, f, indent=2)
                     print(f"[early-stop:TEST] it={it} small-eval test_mse={test_mse_val:.6f} < {self.algo.early_stop_test_mse_threshold}. Stopping.")
-                    return {"path": save_path, "traj": hist}
-            # -------- end independent test-MSE early stop --------
+                    return {"path": save_path, "traj": hist, "snapshots": self._snapshots}
 
             # -------- legacy/other early stopping with FP + rho checks --------
             early_stopped = False
@@ -775,7 +939,6 @@ class RSCavityExplicitMulti:
                 else:
                     best_counter = 0
                 if best_counter >= self.algo.early_stop_patience:
-                    # FULL EVAL at early stop
                     self._ensure_full_eval_set()
                     ev = self._eval_on_X(self._X_eval_full)
                     rhomin = float(self.rho.min().item()); rhomax = float(self.rho.max().item())
@@ -825,13 +988,19 @@ class RSCavityExplicitMulti:
                             }
                         }
                     }
+
+                    # NEW: snapshot final at composite early stop
+                    self._snapshots["final"] = self._save_particles(
+                        base_prefix, stage="final", stride=1, to_dtype=torch.float32, save_npz=True
+                    )
+                    payload["snapshots"] = self._snapshots
+
                     maybe_save(payload, force=True)
                     print(f"[early-stop] it={it} mean_train_mse={train_mse_mean:.6f} fp_residual={fp_residual_mean:.6e} rho_delta_rel={rho_delta_rel:.3e}.")
                     early_stopped = True
 
             if early_stopped:
                 break
-            # -------- end early stopping --------
 
             # Routine logging/eval
             if it % self.algo.log_every == 0:
@@ -954,10 +1123,17 @@ class RSCavityExplicitMulti:
                 }
             }
         }
+
+        # NEW: snapshot final at normal end
+        self._snapshots["final"] = self._save_particles(
+            base_prefix, stage="final", stride=1, to_dtype=torch.float32, save_npz=True
+        )
+        payload["snapshots"] = self._snapshots
+
         with open(save_path, "w") as f:
             json.dump(payload, f, indent=2)
 
-        return {"path": save_path, "traj": hist}
+        return {"path": save_path, "traj": hist, "snapshots": self._snapshots}
 
 # ----------------------------- experiment driver ------------------------------
 
@@ -1022,7 +1198,9 @@ def worker_process(dev_id: int, shard: List[Dict[str, Any]], mdl_dict: Dict[str,
         dev_tag = f"dev{dev_id}"
         print(f"\n===== RUN start: P={P}, kappa={kappa:.6g}, T={solver.T:.6g}, E={E}, device={device}, dtype={'float64' if algo.use_float64 else 'float32'} =====")
         result = solver.run(X, y, out_dir, tag=tag, dev_tag=dev_tag)
-        print(f"===== RUN done: saved -> {result['path']} =====\n")
+        print(f"===== RUN done: saved -> {result['path']} =====")
+        if 'snapshots' in result:
+            print(f"Snapshots: {result['snapshots']}")
 
         del solver, X, y
         if torch.cuda.is_available():
@@ -1037,18 +1215,18 @@ if __name__ == "__main__":
     d = 35
 
     P_train_list =[500,1000,10000,2133 ,10, 100, 750, 3666, 5000, 7500]
-    kappa_list   =  [5e-4]  #5e-3,7-5e-3,5e-4,1e-3,1e-2
+    kappa_list   =  [5e-3]  #5e-3,7-5e-3,5e-4,1e-3,1e-2
     num_exp = 3
     base_seed = 123456
 
     use_float64 = False
     mdl = Model(d=d, B=512, N=512, gamma=0.5, sigma_a=1.0, sigma_w=1.0, act="relu")
     algo = Algo(
-        outer_steps=7_500_000,
+        outer_steps=10_000_000,
         step_size=1e-2,
         log_every=50_000,            # less frequent logs
         batch_eval=131_072,
-        P_chunk_train=131_072*2,       # big chunks for better GPU utilization
+        P_chunk_train=131_072*2,     # big chunks for better GPU utilization
 
         use_float64=use_float64,
         grad_clip_norm=None,
@@ -1059,7 +1237,7 @@ if __name__ == "__main__":
         # --- Composite early stop (unchanged) ---
         early_stop_enabled=True,
         early_stop_use_mse=True,
-        early_stop_threshold=0.001,
+        early_stop_threshold=0.005,
         early_stop_patience=100,
         early_stop_use_fp=True,
         early_stop_fp_epsilon=0.005,
@@ -1069,22 +1247,22 @@ if __name__ == "__main__":
         # --- Independent TEST MSE early stop (new) ---
         early_stop_test_mse_enabled=True,
         early_stop_test_mse_threshold=0.01,
-        test_mse_check_every=5000,          # check every outer iter; raise if too heavy
+        test_mse_check_every=5000,
         test_mse_use_small_eval=True,
 
         # --- LR decay (power 2) ---
         use_lr_decay=True,
-        lr_start=2e-3,
-        lr_end=5e-5,
-        lr_decay_iters=3_000_000,
+        lr_start=1e-3,     # you can set to 1e-3 to mirror Code 2 exactly
+        lr_end=5e-4,       # set to 5e-4 to mirror Code 2 exactly
+        lr_decay_iters=2_000_000,  # set to 2_000_000 to mirror Code 2 exactly
 
         # --- Inner SGLD steps schedule ---
-        K0=15,
+        K0=12,
         Kmin=2,
         K_decay=600_000,
 
         # --- Anderson acceleration ---
-        use_anderson=True,
+        use_anderson=False,
         aa_depth=3,
         aa_reg=1e-8,
         aa_every=1,
@@ -1094,12 +1272,12 @@ if __name__ == "__main__":
         P_eval_routine=32_768,  # cheap routine eval
         save_every_logs=2,      # write json every 3rd log event
     )
-    alpha0 = 0.01
+    alpha0 = 0.25
     beta01 = alpha0 / d
-    ard = ARD(use_ard=True, alpha0=alpha0, ema=0.5, update_every=1,
+    ard = ARD(use_ard=False, alpha0=alpha0, ema=0.5, update_every=1,
               rho_min=0.0, rho_max=1e18, beta0=beta01)
 
-    out_dir = "/home/goring/mean_field_langevin/MCMC_composite/results_d35k4hm_paper_final_conv2_long_fin_ard0.01_lr2/5e-4"
+    out_dir = "/home/goring/mean_field_langevin/MCMC_composite/results_d35k4hm_paper_final_conv2_long_fin_noard_fix/5e-3"
     shard_strategy = "round_robin"
 
     os.makedirs(out_dir, exist_ok=True)
