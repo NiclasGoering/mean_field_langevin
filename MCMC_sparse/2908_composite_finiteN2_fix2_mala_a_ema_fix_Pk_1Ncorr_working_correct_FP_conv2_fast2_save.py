@@ -1214,7 +1214,7 @@ if __name__ == "__main__":
     teacher_sets_spec = "{0,1,2,3}"
     d = 35
 
-    P_train_list =[500,1000,10000,2133 ,10, 100, 750, 3666, 5000, 7500]
+    P_train_list =[10000,2133 ,10, 100]
     kappa_list   =  [5e-3]  #5e-3,7-5e-3,5e-4,1e-3,1e-2
     num_exp = 3
     base_seed = 123456
@@ -1272,12 +1272,12 @@ if __name__ == "__main__":
         P_eval_routine=32_768,  # cheap routine eval
         save_every_logs=2,      # write json every 3rd log event
     )
-    alpha0 = 0.25
+    alpha0 = 0.01
     beta01 = alpha0 / d
-    ard = ARD(use_ard=False, alpha0=alpha0, ema=0.5, update_every=1,
+    ard = ARD(use_ard=True, alpha0=alpha0, ema=0.5, update_every=1,
               rho_min=0.0, rho_max=1e18, beta0=beta01)
 
-    out_dir = "/home/goring/mean_field_langevin/MCMC_composite/results_d35k4hm_paper_final_conv2_long_fin_noard_fix/5e-3"
+    out_dir = "/home/goring/mean_field_langevin/MCMC_composite/results_d35k4hm_paper_final_conv2_long_fin_ard_0.01_fix/5e-3"
     shard_strategy = "round_robin"
 
     os.makedirs(out_dir, exist_ok=True)

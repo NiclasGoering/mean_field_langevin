@@ -9,7 +9,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.multiprocessing as mp
 from filelock import FileLock
-from torch.cuda.amp import autocast
 import queue as pyqueue  # for Empty exception in mp.Queue
 from torch.amp import autocast
 
@@ -33,10 +32,11 @@ def generate_k_sparse_parity_data(P, d, k, device='cpu'):
 # -----------------------------
 class TwoLayerNet(nn.Module):
     """
-    f(x) = (1 / N^gamma) * sum_i a_i * ReLU(w_i^T x)
+    f(x) = (1 / N^gamma) * sum_i a_i * phi(w_i^T x)
+    where phi can be ReLU or sigmoid.
     Prior: a_i ~ N(0, g_a),  w_jk ~ N(0, g_w/d) independently.
     """
-    def __init__(self, d, N, g_w, g_a, gamma_scaling_exponent: float):
+    def __init__(self, d, N, g_w, g_a, gamma_scaling_exponent: float, activation='relu'):
         super().__init__()
         self.d = d
         self.N = N
@@ -49,10 +49,30 @@ class TwoLayerNet(nn.Module):
 
         self.w = nn.Parameter(torch.randn(d, N) * self.sigma_w)
         self.a = nn.Parameter(torch.randn(N, 1) * self.sigma_a)
-        self.phi = F.relu
+        
+        # Set activation function
+        if activation == 'sigmoid':
+            self.phi = torch.sigmoid
+        elif activation == 'relu':
+            self.phi = F.relu
+        else:
+            raise ValueError(f"Unknown activation: {activation}. Must be 'relu' or 'sigmoid'.")
 
     def forward(self, x):
         return (self.phi(x @ self.w) @ self.a) / (self.N ** self.gamma)
+
+    # +++ NEW METHOD +++
+    def homogeneity_loss(self):
+        """
+        Penalize variance of |w| within each neuron (column).
+
+        self.w is shape (d, N).
+        We take abs(w), compute variance across dim 0 (the d components) for each
+        of the N neurons, then sum these N variances.
+        """
+        w_abs = self.w.abs()  # (d, N)
+        var_per_neuron = torch.var(w_abs, dim=0, unbiased=False)
+        return var_per_neuron.sum()
 
 # -----------------------------
 # LR schedule helper
@@ -162,6 +182,7 @@ def is_success(train_err_01: float, test_err_01: float) -> bool:
 # -----------------------------
 # Training (with conditional full-batch)
 # -----------------------------
+# +++ MODIFIED FUNCTION +++
 def train_with_langevin(model, X_train, y_train, X_test, y_test, hyperparams, current_config, device, use_full_batch):
     """
     Trains using Langevin GD.
@@ -171,8 +192,8 @@ def train_with_langevin(model, X_train, y_train, X_test, y_test, hyperparams, cu
     Early stopping:
       * Default (unchanged): trigger when test MSE < 0.03, then continue +100k epochs and stop.
       * NEW SWITCH: if (P_train <= hyperparams['train_error_switch_P_below']) OR
-                    (kappa_0 >= hyperparams['train_error_switch_kappa_above']),
-                    trigger when TRAIN 0-1 error <= 0.01, then continue +100k epochs and stop.
+                      (kappa_0 >= hyperparams['train_error_switch_kappa_above']),
+                      trigger when TRAIN 0-1 error <= 0.01, then continue +100k epochs and stop.
     """
     epochs = hyperparams['epochs']
     log_interval = hyperparams['log_interval']
@@ -202,6 +223,11 @@ def train_with_langevin(model, X_train, y_train, X_test, y_test, hyperparams, cu
     k = int(current_config['k'])
     exp_id = int(current_config['exp_id'])
 
+    # +++ GET NEW HYPERPARAM +++
+    lambda_h = float(hyperparams.get("homogeneity_penalty_weight", 0.0))
+    if lambda_h > 0.0:
+        print(f"[GPU {device}] Applying homogeneity penalty with lambda_h = {lambda_h:.2e}")
+
     # Optimizer with two param groups (so each carries its sigma^2)
     optimizer = LangevinGD(
         params=[
@@ -223,12 +249,15 @@ def train_with_langevin(model, X_train, y_train, X_test, y_test, hyperparams, cu
     )
     TRAIN_ERR_TARGET = 0.01  # as requested
 
-    early_stop_mode_str = "train_err<=0.01" if use_train_error_switch else "test_mse<0.03"
+    early_stop_mode_str = "train_err<=0.01" if use_train_error_switch else "test_mse<0.01"
+    
+    # Get activation for logging
+    activation = current_config.get('activation', hyperparams.get('activation', 'relu'))
 
     print(f"[GPU {device}] Start (bf16): P={P_train}, d={d}, k={k}, exp={exp_id}, "
           f"N={N}, gamma={gamma_scaling_exponent}, k0={kappa_0:.3e}, "
           f"eta0={eta_start:.2e}, etaf={eta_final:.2e}, T={T:.4e}, "
-          f"full_batch={use_full_batch}, decay_steps={lr_decay_steps}, p={lr_power}, "
+          f"activation={activation}, full_batch={use_full_batch}, decay_steps={lr_decay_steps}, p={lr_power}, "
           f"early_stop={early_stop_mode_str}")
 
     start_time = time.time()
@@ -254,12 +283,24 @@ def train_with_langevin(model, X_train, y_train, X_test, y_test, hyperparams, cu
             optimizer.zero_grad(set_to_none=True)
             with autocast("cuda", dtype=torch.bfloat16):
                 y_pred_train = model(X_train)
-                train_loss_mean = loss_fn(y_pred_train, y_train)
-            train_loss_mean.backward()
+                # 1. Calculate base MSE loss
+                train_mse_loss = loss_fn(y_pred_train, y_train)
+
+                # +++ 2. ADD HOMOGENEITY PENALTY +++
+                if lambda_h > 0.0:
+                    homog_loss = model.homogeneity_loss() * lambda_h
+                    total_loss = train_mse_loss + homog_loss
+                else:
+                    total_loss = train_mse_loss
+                # +++ END +++
+
+            # 3. Backprop on the TOTAL loss
+            total_loss.backward()
             optimizer.step()
 
             # Metrics on train
-            train_mse = train_loss_mean.detach().item()
+            # Log the un-penalized MSE
+            train_mse = train_mse_loss.detach().item()
             train_correct = (torch.sign(y_pred_train.detach()) == y_train).sum().item()
             train_error_01 = 1.0 - (train_correct / P_train)
         else:
@@ -273,11 +314,25 @@ def train_with_langevin(model, X_train, y_train, X_test, y_test, hyperparams, cu
                 optimizer.zero_grad(set_to_none=True)
                 with autocast("cuda", dtype=torch.bfloat16):
                     yb_pred = model(xb)
-                    batch_loss_mean = loss_fn(yb_pred, yb)
-                batch_loss_mean.backward()
+                    # 1. Calculate base MSE loss
+                    batch_mse_loss = loss_fn(yb_pred, yb)
+
+                    # +++ 2. ADD HOMOGENEITY PENALTY +++
+                    # This is correct for SGLD: the regularizer's
+                    # full gradient is added at each step.
+                    if lambda_h > 0.0:
+                        homog_loss = model.homogeneity_loss() * lambda_h
+                        total_loss = batch_mse_loss + homog_loss
+                    else:
+                        total_loss = batch_mse_loss
+                    # +++ END +++
+
+                # 3. Backprop on the TOTAL loss
+                total_loss.backward()
                 optimizer.step()
 
-                train_mse_sum += batch_loss_mean.detach().item() * xb.shape[0]
+                # Log the un-penalized MSE
+                train_mse_sum += batch_mse_loss.detach().item() * xb.shape[0]
                 train_correct_accum += (torch.sign(yb_pred.detach()) == yb).sum().item()
 
             train_mse = train_mse_sum / P_train
@@ -316,7 +371,7 @@ def train_with_langevin(model, X_train, y_train, X_test, y_test, hyperparams, cu
                               f"Continuing until epoch {stop_after_epoch}.")
                 else:
                     # Original behavior: use test MSE threshold
-                    if test_mse < 0.03:
+                    if test_mse < 0.04:
                         stop_after_epoch = epoch + 100_000
                         print(f"[GPU {device}] Early-stop trigger hit (test MSE {test_mse:.3e}). "
                               f"Continuing until epoch {stop_after_epoch}.")
@@ -421,9 +476,13 @@ def worker(global_rank,
 
         X_train, y_train = generate_k_sparse_parity_data(P_train, d, k, device=device)
 
+        # Get activation from config or hyperparams (config takes precedence)
+        activation = current_config.get('activation', hyperparams.get('activation', 'relu'))
+        
         model = TwoLayerNet(
             d=d, N=hyperparams['N'], g_w=hyperparams['g_w'],
-            g_a=hyperparams['g_a'], gamma_scaling_exponent=gamma_scaling_exponent
+            g_a=hyperparams['g_a'], gamma_scaling_exponent=gamma_scaling_exponent,
+            activation=activation
         ).to(device)
 
         # compile the model (no logic change)
@@ -495,55 +554,60 @@ def worker(global_rank,
 # -----------------------------
 def main():
     # --- Hyperparameters (fixed across jobs) ---
+    # +++ MODIFIED DICTIONARY +++
     hyperparams = {
         # Model / data params
         "N": 512,
         "g_w": 1.0,
         "g_a": 1.0,
+        
+        # Activation function: 'relu' or 'sigmoid'
+        "activation": "sigmoid",  # Change to 'relu' for ReLU activation
+
+        # +++ NEW HYPERPARAMETER +++
+        # Strength of the homogeneity penalty.
+        # You will need to tune this value. Start small.
+        "homogeneity_penalty_weight": 0.0,  # Example value, tune this!
 
         # Training params
-        "epochs": 7_500_000,
+        "epochs": 20_000_000,
         "log_interval": 250_000,
         "P_test": 100_000,
-        "batch_size": 200_000,   # full-batch triggers when P_train <= batch_size
-        "early_stop_loss": 1e-20,    # kept for JSON continuity
-        "early_stop_error": 1e-20,   # kept for JSON continuity
+        "batch_size": 200_000,  # full-batch triggers when P_train <= batch_size
+        "early_stop_loss": 1e-20,   # kept for JSON continuity
+        "early_stop_error": 1e-20,  # kept for JSON continuity
 
         # LR schedule knobs
-        "lr_decay_steps": 2_000_000,  # try 300_000 (aggressive) or 2_000_000 (conservative)
+        "lr_decay_steps": 5_000_000,  # try 300_000 (aggressive) or 2_000_000 (conservative)
         "lr_power": 2.0,
 
         # Number of runs per unique (d, k, P, kappa_0, eta, gamma)
-        "num_exp": 3,
+        "num_exp": 2,
 
         # Optional seed family
         "base_seed": 12345,
 
         # -----------------------------
         # NEW: Early-stop switching thresholds
-        # Switch to TRAIN 0-1 error <= 0.01 when:
-        #   (P_train <= train_error_switch_P_below) OR
-        #   (kappa_0  >= train_error_switch_kappa_above)
-        # Set to None to disable either condition.
         # -----------------------------
-        "train_error_switch_P_below": 550,     # example: small-P jobs use train-error early stop
+        "train_error_switch_P_below": 550,      # example: small-P jobs use train-error early stop
         "train_error_switch_kappa_above": 0.02, # example: large-kappa jobs use train-error early stop
     }
 
     # --- Save directory ---
-    base_save_dir = Path("/home/goring/mean_field_langevin/Langevin_training/results_paper1/d35_k4_lrdecay")
+    base_save_dir = Path("/home/goring/mean_field_langevin/Langevin_training/results_rebuttal/d35_k3_sig_full")
     base_save_dir.mkdir(exist_ok=True, parents=True)
 
     # --- Experiment Grids (ORDER MATTERS) ---
     d_values = [35]
-    k_values = [4]
+    k_values = [3]  # k <= d
 
     # P descending (start from largest P)
-    P_values = [10, 100, 500, 750, 1000, 2133, 3666, 5000, 7500, 10000]  #
-    # P_values = sorted(P_values, reverse=True)  # descending
+    P_values = [10,100,500,1000,2333,5000,7666,10000]#[500,1000,10000,2133 ,10, 100, 750, 3666, 5000, 7500,20000,30000,50000]
+    #P_values = sorted(P_values, reverse=True)  # descending
 
-    # kappa ascending (start from smallest kappa)
-    kappa_0_values = [7.5e-3, 1e-2, 1e-3, 5e-3, 7.5e-2, 2.5e-2, 5e-2, 5e-4]  # more: [7.5e-3, 1e-2, 1e-1, 1e-3, 5e-3, 7.5e-2, 2.5e-2, 5e-2, 5e-4]
+    # kappa ascending (start from smallest kappa
+    kappa_0_values = [5e-3]
     kappa_0_values = sorted(kappa_0_values)   # ascending
 
     # gamma values
@@ -552,7 +616,7 @@ def main():
     # LR grid (FINAL values)
     eta_values = [5e-4]
     # starting LR
-    eta_start = 1e-3
+    eta_start = 2e-3
 
     # Save hyperparams snapshot (+ the grids we sweep)
     snapshot = dict(hyperparams)
@@ -597,9 +661,9 @@ def main():
     for d in d_values:
         for k in k_values:
             for gamma in gamma_values:
-                for k0 in kappa_0_values:           # kappa ascending outer loop
-                    for P in P_values:               # P descending inner loop
-                        for eta in eta_values:       # FINAL LR
+                for k0 in kappa_0_values:      # kappa ascending outer loop
+                    for P in P_values:          # P descending inner loop
+                        for eta in eta_values:  # FINAL LR
                             for exp_id in range(hyperparams['num_exp']):
                                 key = (int(P),
                                        f"{float(k0):.8f}",
@@ -617,6 +681,7 @@ def main():
                                         "eta": float(eta),             # FINAL lr
                                         "eta_start": float(eta_start), # START lr
                                         "gamma_scaling_exponent": float(gamma),
+                                        "activation": hyperparams.get('activation', 'relu'),
                                     })
                                     job_count += 1
 
@@ -632,7 +697,7 @@ def main():
         return
     print(f"Found {num_gpus} GPU(s).")
 
-    # --- 2 workers/GPU (as requested) ---
+    # --- 2 workers/GPU ---
     per_gpu_workers = 2
     nprocs = num_gpus * per_gpu_workers
     print(f"Launching {nprocs} workers ({per_gpu_workers} per GPU).")

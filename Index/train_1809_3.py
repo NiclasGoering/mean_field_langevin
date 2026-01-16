@@ -1,0 +1,600 @@
+import os
+import json
+import time
+from pathlib import Path
+import math
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.multiprocessing as mp
+from filelock import FileLock
+from torch.cuda.amp import autocast
+import queue as pyqueue  # for Empty exception in mp.Queue
+import traceback # For detailed error logging
+import torch._dynamo # For clearing the compiler cache
+
+# -----------------------------
+# Data
+# -----------------------------
+# Degree of the Hermite polynomial g(z) = H_p(z).
+# You can override via environment variable: export HERMITE_DEGREE=5
+HERMITE_DEGREE = int(os.environ.get("HERMITE_DEGREE", "4"))
+
+def _hermite_he(z: torch.Tensor, n: int) -> torch.Tensor:
+    """
+    Probabilists' Hermite polynomials He_n(z) defined by:
+        He_0(z)=1, He_1(z)=z, He_{n+1}(z) = z * He_n(z) - n * He_{n-1}(z)
+    Works elementwise on a tensor z.
+    """
+    if n < 0:
+        raise ValueError("Hermite degree n must be >= 0")
+    if n == 0:
+        return torch.ones_like(z)
+    if n == 1:
+        return z
+    He_nm1 = torch.ones_like(z)    # He_0
+    He_n_  = z                     # He_1
+    for k in range(1, n):
+        He_np1 = z * He_n_ - k * He_nm1
+        He_nm1, He_n_ = He_n_, He_np1
+    return He_n_
+
+def generate_k_sparse_parity_data(P, d, k, device='cpu'):
+    """
+    NEW DATA GENERATOR (single-index Hermite model; signature kept the same).
+
+    - Input: X ~ N(0, I_d)
+    - Projection vector: w is unit-norm with equal mass on the first k coords
+                         w = (1/sqrt(k)) * [1,...,1, 0,...,0]^T
+    - Index: z = X @ w  ~ N(0,1)
+    - Link g: degree-p probabilists' Hermite polynomial He_p(z)
+    - Label: y = sign(He_p(z)) in {-1, +1}, shaped (P,1)
+
+    Notes:
+    * We keep the function name & args unchanged so the training code
+      and the rest of the pipeline remain exactly the same.
+    * If He_p(z) == 0 (measure-zero under Gaussian), we map to +1.
+    """
+    if k > d:
+        raise ValueError("k (number of nonzero projection coords) cannot be greater than d (dimensionality).")
+    # Inputs: standard Gaussian
+    X = torch.randn(P, d, device=device, dtype=torch.float32)
+
+    # Projection vector w with support on first k coordinates and ||w||=1
+    w = torch.zeros(d, device=device, dtype=torch.float32)
+    if k > 0:
+        w[:k] = 1.0 / math.sqrt(k)
+
+    # Single index z ~ N(0,1)
+    z = X @ w  # shape (P,)
+
+    # g(z) = He_p(z)
+    p = HERMITE_DEGREE
+    gz = _hermite_he(z, p)
+
+    # Labels in {-1, +1}; map zero to +1 to avoid 0 labels
+    #y = torch.where(gz >= 0, torch.tensor(1.0, device=device), torch.tensor(-1.0, device=device)).unsqueeze(1)
+    y = gz.unsqueeze(1)
+    return X, y
+
+# -----------------------------
+# Model
+# -----------------------------
+class TwoLayerNet(nn.Module):
+    """
+    f(x) = (1 / N^gamma) * sum_i a_i * ReLU(w_i^T x)
+    Prior: a_i ~ N(0, g_a),  w_jk ~ N(0, g_w/d) independently.
+    """
+    def __init__(self, d, N, g_w, g_a, gamma_scaling_exponent: float):
+        super().__init__()
+        self.d = d
+        self.N = N
+        self.gamma = float(gamma_scaling_exponent)
+
+        sigma_w_sq = float(g_w) / d
+        sigma_a_sq = float(g_a)
+        self.sigma_w = math.sqrt(sigma_w_sq)
+        self.sigma_a = math.sqrt(sigma_a_sq)
+
+        self.w = nn.Parameter(torch.randn(d, N) * self.sigma_w)
+        self.a = nn.Parameter(torch.randn(N, 1) * self.sigma_a)
+        self.b = nn.Parameter(torch.zeros(N))     # <-- added hidden bias
+        self.c = nn.Parameter(torch.zeros(1))     # <-- added output bias
+        self.phi = F.relu
+
+    def forward(self, x):
+        # The line below was `(self.phi(x @ self.w + self.b) @ self.a) / (self.N ** self.gamma)`
+        # Adding the output bias 'c' is crucial for the model to learn.
+        return (self.phi(x @ self.w + self.b) @ self.a) / (self.N ** self.gamma) + self.c
+
+# -----------------------------
+# LR schedule helper
+# -----------------------------
+def poly_decay_lr(epoch: int, eta_start: float, eta_final: float,
+                  decay_steps: int, power: float = 2.0) -> float:
+    """
+    Polynomial decay from eta_start to eta_final over 'decay_steps' steps.
+    Holds at eta_final afterwards.
+    """
+    if decay_steps <= 0:
+        return eta_final
+    tau = min(1.0, epoch / float(decay_steps))
+    return eta_final + (eta_start - eta_final) * (1.0 - tau) ** power
+
+# -----------------------------
+# Custom Optimizer (SGLD/Langevin-GD) with foreach updates
+# -----------------------------
+class LangevinGD(torch.optim.Optimizer):
+    """
+    Param groups must include 'sigma_sq' in each group.
+    Update: p <- p - lr * ( (T/sigma_sq) * p + grad ) + sqrt(2*T*lr) * N(0,I)
+    """
+    def __init__(self, params, lr, T):
+        if lr < 0.0:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        defaults = dict(lr=lr, T=T)
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            lr = float(group['lr'])
+            T = float(group['T'])
+            sigma_sq = group.get('sigma_sq', None)
+            if sigma_sq is None:
+                raise ValueError("Each param group must have 'sigma_sq' set.")
+
+            # collect tensors that have grads
+            ps = [p for p in group['params'] if p.grad is not None]
+            if not ps:
+                continue
+            
+            decay_coeff = T / (float(sigma_sq) + 1e-12)
+            decays = [p.mul(decay_coeff) for p in ps]
+
+            # -lr * (decay + grad)
+            drift_updates = [-(lr) * (d + p.grad) for p, d in zip(ps, decays)]
+
+            # sqrt(2*T*lr) * N(0, I)  -- generate in fp32 then cast to param dtype
+            noise_std = math.sqrt(2.0 * T * lr)
+            noises = [torch.randn_like(p, dtype=torch.float32).mul_(noise_std).to(p.dtype) for p in ps]
+
+            # combined updates: drift + noise
+            updates = [du + nz for du, nz in zip(drift_updates, noises)]
+
+            # foreach fused add
+            torch._foreach_add_(ps, updates)
+
+        return loss
+
+def _cavity_constants(y_pred: torch.Tensor, y_true: torch.Tensor):
+    yp = y_pred.to(torch.float32)
+    yt = y_true.to(torch.float32)
+    m_S = (yp * yt).mean().item()
+    r = yp - m_S * yt
+    noise_norm2 = (r * r).mean().item()
+    err01_direct = (torch.sign(yp) != yt).float().mean().item()
+    return m_S, noise_norm2, err01_direct
+
+# -----------------------------
+# JSON Utils
+# -----------------------------
+def save_result(result, json_path):
+    """Safely appends a result to the JSON file using a file lock."""
+    lock = FileLock(str(json_path) + ".lock")
+    with lock:
+        try:
+            if json_path.exists() and json_path.stat().st_size > 0:
+                with open(json_path, 'r') as f:
+                    data = json.load(f)
+            else:
+                data = []
+        except json.JSONDecodeError:
+            data = []
+        data.append(result)
+        with open(json_path, 'w') as f:
+            json.dump(data, f, indent=4)
+
+# -----------------------------
+# Pruning success criterion (kept for reporting only)
+# -----------------------------
+def is_success(train_err_01: float, test_err_01: float) -> bool:
+    """
+    Success cap:
+      - train 0-1 error <= 1e-3
+      - test  0-1 error <= 0.25
+    """
+    return (train_err_01 <= 1e-3) and (test_err_01 <= 0.25)
+
+# -----------------------------
+# Training (with conditional full-batch)
+# -----------------------------
+def train_with_langevin(model, X_train, y_train, X_test, y_test, hyperparams, current_config, device, use_full_batch):
+    epochs = hyperparams['epochs']
+    log_interval = hyperparams['log_interval']
+    batch_size = hyperparams['batch_size']
+
+    eta_final = float(current_config['eta'])
+    eta_start = float(current_config.get('eta_start', eta_final))
+    lr_decay_steps = int(hyperparams.get('lr_decay_steps', 0))
+    lr_power = float(hyperparams.get('lr_power', 2.0))
+
+    P_train = int(X_train.shape[0])
+    N = model.N
+    sigma_a = float(model.sigma_a)
+    sigma_w = float(model.sigma_w)
+
+    kappa_0 = float(current_config['kappa_0'])
+    gamma_scaling_exponent = float(current_config['gamma_scaling_exponent'])
+
+    kappa = kappa_0
+    T = 2.0 * (kappa ** 2)
+
+    loss_fn = nn.MSELoss(reduction='mean')
+
+    d = int(current_config['d'])
+    k = int(current_config['k'])
+    exp_id = int(current_config['exp_id'])
+
+    optimizer = LangevinGD(
+        params=[
+            {'params': [model.a, model.c], 'sigma_sq': sigma_a ** 2},
+            {'params': [model.w, model.b], 'sigma_sq': sigma_w ** 2},
+        ],
+        lr=eta_start,
+        T=T,
+    )
+    
+    P_switch = hyperparams.get('train_error_switch_P_below', None)
+    kappa_switch = hyperparams.get('train_error_switch_kappa_above', None)
+    use_train_error_switch = (
+        (P_switch is not None and P_train <= int(P_switch)) or
+        (kappa_switch is not None and kappa_0 >= float(kappa_switch))
+    )
+    TRAIN_ERR_TARGET = 0.01
+
+    early_stop_mode_str = "train_err<=0.01" if use_train_error_switch else "test_mse<0.015"
+
+    print(f"[GPU {device}] Start (bf16): P={P_train}, d={d}, k={k}, exp={exp_id}, "
+          f"N={N}, gamma={gamma_scaling_exponent}, k0={kappa_0:.3e}, "
+          f"eta0={eta_start:.2e}, etaf={eta_final:.2e}, T={T:.4e}, "
+          f"full_batch={use_full_batch}, decay_steps={lr_decay_steps}, p={lr_power}, "
+          f"early_stop={early_stop_mode_str}")
+
+    start_time = time.time()
+    epochs_run = 0
+    stop_after_epoch = None
+    stopped_early = False
+
+    with torch.no_grad():
+        with autocast(dtype=torch.bfloat16):
+            y_pred_test0 = model(X_test)
+    init_eval_mS, init_eval_noise_norm2, init_eval_err01_direct = _cavity_constants(y_pred_test0, y_test)
+
+    # training loop
+    for epoch in range(epochs + 1):
+        lr_t = poly_decay_lr(epoch, eta_start, eta_final, lr_decay_steps, lr_power)
+        for g in optimizer.param_groups:
+            g['lr'] = lr_t
+
+        model.train()
+
+        if use_full_batch:
+            optimizer.zero_grad(set_to_none=True)
+            with autocast(dtype=torch.bfloat16):
+                # FIX: Clone the output to prevent CUDAGraphs memory overwriting issue.
+                y_pred_train = model(X_train).clone()
+                train_loss_mean = loss_fn(y_pred_train, y_train)
+            train_loss_mean.backward()
+            optimizer.step()
+            train_mse = train_loss_mean.detach().item()
+            train_error_01 = (torch.sign(y_pred_train.detach()) != y_train).float().mean().item()
+        else: # mini-batch
+            train_mse_sum = 0.0
+            train_correct_accum = 0
+            for i in range(0, P_train, batch_size):
+                xb = X_train[i:i + batch_size]
+                yb = y_train[i:i + batch_size]
+
+                optimizer.zero_grad(set_to_none=True)
+                with autocast(dtype=torch.bfloat16):
+                    # FIX: Clone the output to prevent CUDAGraphs memory overwriting issue.
+                    yb_pred = model(xb).clone()
+                    batch_loss_mean = loss_fn(yb_pred, yb)
+                batch_loss_mean.backward()
+                optimizer.step()
+
+                train_mse_sum += batch_loss_mean.detach().item() * xb.shape[0]
+                train_correct_accum += (torch.sign(yb_pred.detach()) == yb).sum().item()
+
+            train_mse = train_mse_sum / P_train
+            train_error_01 = 1.0 - (train_correct_accum / P_train)
+            
+        if epoch % log_interval == 0:
+            model.eval()
+            with torch.no_grad():
+                with autocast(dtype=torch.bfloat16):
+                    y_pred_test = model(X_test)
+                test_mse = loss_fn(y_pred_test, y_test).item()
+                test_error_01 = (torch.sign(y_pred_test) != y_test).float().mean().item()
+
+            elapsed = time.time() - start_time
+            print(f"[GPU {device}] P={P_train}, d={d}, k={k}, exp={exp_id}, "
+                  f"gamma={gamma_scaling_exponent}, k0={kappa_0:.3e}, eta_now={lr_t:.2e} | "
+                  f"Ep {epoch:>7} | Train MSE: {train_mse:.6f} | Test MSE: {test_mse:.6f} | "
+                  f"Train Err: {train_error_01:.6f} | Test Err: {test_error_01:.6f} | "
+                  f"T={T:.4e} | Time: {elapsed:.1f}s | ES:{early_stop_mode_str}")
+
+            if np.isnan(train_mse) or np.isnan(test_mse):
+                print(f"[GPU {device}] NaN detected. Stopping.")
+                stopped_early = False
+                epochs_run = epoch
+                break
+            
+            if stop_after_epoch is None:
+                trigger_hit = False
+                if use_train_error_switch:
+                    if train_mse <= TRAIN_ERR_TARGET:
+                        trigger_hit = True
+                        print(f"[GPU {device}] Early-stop trigger hit (train err <= {TRAIN_ERR_TARGET:.3f}).")
+                else: # Original behavior
+                    if test_mse < 0.015:
+                        trigger_hit = True
+                        print(f"[GPU {device}] Early-stop trigger hit (test MSE {test_mse:.3e}).")
+
+                if trigger_hit:
+                    stop_after_epoch = epoch + 100_000
+                    print(f"Continuing until epoch {stop_after_epoch}.")
+
+            if stop_after_epoch is not None and epoch >= stop_after_epoch:
+                stopped_early = True
+                epochs_run = epoch
+                print(f"[GPU {device}] Early-stop completed at epoch {epoch}.")
+                break
+
+    epochs_run = epoch
+
+    model.eval()
+    with torch.no_grad():
+        with autocast(dtype=torch.bfloat16):
+            # FIX: Clone outputs here as well to be safe during final evaluation.
+            y_pred_train_final = model(X_train).clone()
+            y_pred_test_final  = model(X_test).clone()
+        final_train_mse = loss_fn(y_pred_train_final, y_train).item()
+        final_test_mse  = loss_fn(y_pred_test_final,  y_test ).item()
+        final_train_error_01 = (torch.sign(y_pred_train_final) != y_train).float().mean().item()
+        final_test_error_01 = (torch.sign(y_pred_test_final) != y_test).float().mean().item()
+        final_eval_mS, final_eval_noise_norm2, final_eval_err01_direct = _cavity_constants(y_pred_test_final, y_test)
+
+    print(f"[GPU {device}] Finished: P={P_train}, d={d}, k={k}, exp={exp_id}, "
+          f"gamma={gamma_scaling_exponent}, k0={kappa_0:.3e}, eta0={eta_start:.2e}, etaf={eta_final:.2e}, "
+          f"epochs_run={epochs_run}, stopped_early={stopped_early}, early_stop={early_stop_mode_str}")
+
+    return {
+        "train_mse": final_train_mse, "test_mse": final_test_mse,
+        "train_error_01": final_train_error_01, "test_error_01": final_test_error_01,
+        "stopped_early": stopped_early, "epochs_run": int(epochs_run),
+        "init_eval_mS": init_eval_mS, "init_eval_noise_norm2": init_eval_noise_norm2,
+        "init_eval_err01_direct": init_eval_err01_direct,
+        "final_eval_mS": final_eval_mS, "final_eval_noise_norm2": final_eval_noise_norm2,
+        "final_eval_err01_direct": final_eval_err01_direct,
+        "eta_start": eta_start, "eta_final": eta_final, "lr_decay_steps": lr_decay_steps,
+        "lr_power": lr_power, "early_stop_mode": early_stop_mode_str,
+    }
+
+# -----------------------------
+# Worker (no pruning/skip logic)
+# -----------------------------
+def worker(global_rank, num_gpus, per_gpu_workers, job_queue, hyperparams, base_save_dir):
+    """
+    Worker process. Pulls jobs from the queue, trains, and saves results.
+    Includes robust error handling and resource management.
+    """
+    torch._dynamo.reset()
+
+    device_idx = global_rank % num_gpus
+    device = f'cuda:{device_idx}'
+    torch.cuda.set_device(device_idx)
+    print(f"Worker rank {global_rank} using device {device} (per-GPU workers: {per_gpu_workers}).")
+
+    while True:
+        try:
+            current_config = job_queue.get()
+            if current_config is None:
+                break
+            
+            try:
+                P_train = int(current_config['P'])
+                d = int(current_config['d'])
+                k = int(current_config['k'])
+                exp_id = int(current_config['exp_id'])
+                eta_final = float(current_config['eta'])
+                eta_start = float(current_config.get('eta_start', eta_final))
+                kappa_0 = float(current_config['kappa_0'])
+                gamma_scaling_exponent = float(current_config['gamma_scaling_exponent'])
+
+                # Seed per exp/d/k for reproducibility
+                if 'base_seed' in hyperparams and hyperparams['base_seed'] is not None:
+                    seed = int(hyperparams['base_seed'] + exp_id + 1315423911 * (d + 1) + 2654435761 * (k + 1))
+                    torch.manual_seed(seed)
+                    torch.cuda.manual_seed_all(seed)
+                    np.random.seed(seed % (2**32 - 1))
+                
+                X_train, y_train = generate_k_sparse_parity_data(P_train, d, k, device=device)
+                X_test, y_test = generate_k_sparse_parity_data(hyperparams['P_test'], d, k, device=device)
+
+                model = TwoLayerNet(
+                    d=d, N=hyperparams['N'], g_w=hyperparams['g_w'],
+                    g_a=hyperparams['g_a'], gamma_scaling_exponent=gamma_scaling_exponent
+                ).to(device)
+                
+                try:
+                    model = torch.compile(model, mode='max-autotune')
+                except Exception as e:
+                    print(f"[GPU {device}] torch.compile unavailable or failed: {e}. Proceeding without compile.")
+
+                save_dir = base_save_dir / f"d{d}_k{k}"
+                save_dir.mkdir(exist_ok=True, parents=True)
+
+                def smart_name(prefix):
+                    return (
+                        f"{prefix}_P_{P_train}_d_{d}_k_{k}_exp_{exp_id}"
+                        f"_kappa_{kappa_0:.6f}_eta0_{eta_start:.6e}_etaf_{eta_final:.6e}"
+                        f"_gamma_{gamma_scaling_exponent:.6f}.pt"
+                    )
+
+                init_path = save_dir / smart_name("init_model")
+                final_path = save_dir / smart_name("final_model")
+
+                init_state_frozen = {k_: v_.detach().cpu().clone() for k_, v_ in model.state_dict().items()}
+                torch.save(init_state_frozen, init_path)
+
+                use_full_batch = P_train <= hyperparams['batch_size']
+
+                final_metrics = train_with_langevin(
+                    model, X_train, y_train, X_test, y_test, hyperparams, current_config, device, use_full_batch
+                )
+
+                final_state_frozen = {k_: v_.detach().cpu().clone() for k_, v_ in model.state_dict().items()}
+                torch.save(final_state_frozen, final_path)
+
+                json_path = save_dir / "training_results.json"
+                full_result = {
+                    **current_config, **final_metrics,
+                    "gpu": device_idx, "worker_rank": global_rank,
+                    "N": hyperparams['N'], "g_w": hyperparams['g_w'], "g_a": hyperparams['g_a'],
+                    "epochs": hyperparams['epochs'], "batch_size": hyperparams['batch_size'],
+                    "P_test": hyperparams['P_test'], "status": "trained",
+                    "init_model_path": str(init_path), "final_model_path": str(final_path),
+                    "success": is_success(final_metrics["train_error_01"], final_metrics["test_error_01"]),
+                }
+                save_result(full_result, json_path)
+            
+            except Exception as e:
+                print(f"!!!!!!!!!!!!!\n[GPU {device}] WORKER ERROR on job {current_config}: {e}\n{traceback.format_exc()}!!!!!!!!!!!!!")
+                json_path = base_save_dir / f"d{d}_k{k}" / "training_results.json"
+                error_result = {**current_config, "status": "error", "error_message": str(e)}
+                save_result(error_result, json_path)
+
+        except pyqueue.Empty:
+            break
+        finally:
+            torch.cuda.empty_cache()
+
+    print(f"Worker rank {global_rank} (device {device}) finished and exiting.")
+
+# -----------------------------
+# Main
+# -----------------------------
+def main():
+    torch.set_float32_matmul_precision('high')
+    
+    hyperparams = {
+        "N": 1024, "g_w": 0.5, "g_a": 1.0, "epochs": 4_000_000,
+        "log_interval": 50_000, "P_test": 100_000, "batch_size": 200_000,
+        "lr_decay_steps": 2_500_000, "lr_power": 2.0, "num_exp": 4,
+        "base_seed": 12345, "train_error_switch_P_below": 550,
+        "train_error_switch_kappa_above": 0.02,
+    }
+
+    base_save_dir = Path("/home/goring/mean_field_langevin/Index/results/2009_d18_k2_p4_g0.5_fin_21")
+    base_save_dir.mkdir(exist_ok=True, parents=True)
+
+    d_values = [18]
+    k_values = [2]
+    P_values = [5000]#[75000,25000,10000,50, 100, 1000, 5000, 50000]
+    kappa_0_values = sorted([1e-5, 1e-4, 1e-3, 1e-2, 1e-1])
+    gamma_values = [0.5]
+    eta_values = [5e-4]
+    eta_start = 1e-2
+
+    snapshot = dict(hyperparams)
+    snapshot.update({
+        "P_values_desc": P_values, "kappa_0_values_asc": kappa_0_values,
+        "gamma_values": gamma_values, "eta_values_final": eta_values,
+        "eta_start": eta_start, "d_values": d_values, "k_values": k_values,
+    })
+    with open(base_save_dir / "hyperparameters.json", 'w') as f:
+        json.dump(snapshot, f, indent=4)
+
+    completed_jobs = set()
+    for d in d_values:
+        for k in k_values:
+            json_path = base_save_dir / f"d{d}_k{k}" / "training_results.json"
+            if json_path.exists() and json_path.stat().st_size > 0:
+                try:
+                    with open(json_path, 'r') as f:
+                        results = json.load(f)
+                    for r in results:
+                        required = ['P', 'kappa_0', 'd', 'k', 'exp_id', 'eta', 'gamma_scaling_exponent']
+                        if all(key in r for key in required):
+                            completed_jobs.add(
+                                (int(r['P']), f"{float(r['kappa_0']):.8f}",
+                                 int(r['d']), int(r['k']), int(r['exp_id']),
+                                 f"{float(r['eta']):.8e}", f"{float(r['gamma_scaling_exponent']):.6f}")
+                            )
+                except json.JSONDecodeError:
+                    print(f"Warning: Could not decode existing results for d={d}, k={k}.")
+
+    job_queue = mp.Queue()
+    job_count = 0
+    for d in d_values:
+     for k in k_values:
+      for gamma in gamma_values:
+       for k0 in kappa_0_values:
+        for P in P_values:
+         for eta in eta_values:
+          for exp_id in range(hyperparams['num_exp']):
+            key = (int(P), f"{float(k0):.8f}", int(d), int(k),
+                   int(exp_id), f"{float(eta):.8e}", f"{float(gamma):.6f}")
+            if key not in completed_jobs:
+                job_queue.put({
+                    "P": int(P), "kappa_0": float(k0), "d": int(d),
+                    "k": int(k), "exp_id": int(exp_id), "eta": float(eta),
+                    "eta_start": float(eta_start), "gamma_scaling_exponent": float(gamma),
+                })
+                job_count += 1
+    
+    if job_count == 0:
+        print("All experiments already completed. Exiting.")
+        return
+
+    print(f"Total jobs to run: {job_count}")
+
+    num_gpus = torch.cuda.device_count()
+    if num_gpus == 0:
+        print("No CUDA devices found. This script requires a GPU.")
+        return
+    print(f"Found {num_gpus} GPU(s).")
+    
+    per_gpu_workers = 2
+    nprocs = num_gpus * per_gpu_workers
+    print(f"Launching {nprocs} workers ({per_gpu_workers} per GPU).")
+    
+    for _ in range(nprocs):
+        job_queue.put(None)
+    
+    processes = []
+    for i in range(nprocs):
+        p = mp.Process(target=worker, args=(i, num_gpus, per_gpu_workers, job_queue, hyperparams, base_save_dir))
+        processes.append(p)
+        p.start()
+
+    for p in processes:
+        p.join()
+
+    print("\n--- All jobs completed ---")
+
+if __name__ == '__main__':
+    try:
+        mp.set_start_method('spawn', force=True)
+    except RuntimeError:
+        pass
+    main()
+

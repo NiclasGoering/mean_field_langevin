@@ -6,7 +6,9 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.multiprocessing as mp
-# import torch._dynamo as dynamo
+import torch._dynamo as dynamo
+
+dynamo.config.suppress_errors = True
 # dynamo.config.capture_scalar_outputs = True
 
 # ----------------------------- utils -----------------------------
@@ -27,44 +29,62 @@ def act_prime(z: torch.Tensor, kind: str) -> torch.Tensor:
     if kind == "tanh": return 1.0 - torch.tanh(z) ** 2
     raise ValueError(f"Unknown activation: {kind}")
 
-def parity_character(X_pm1: torch.Tensor, S: torch.Tensor) -> torch.Tensor:
-    if X_pm1.dim() == 2:
-        if S.numel() == 0:
-            return torch.ones(X_pm1.shape[0], device=X_pm1.device, dtype=X_pm1.dtype)
-        return X_pm1[:, S].prod(dim=1).to(X_pm1.dtype)
-    elif X_pm1.dim() == 3:
-        if S.numel() == 0:
-            return torch.ones(X_pm1.shape[0], X_pm1.shape[1], device=X_pm1.device, dtype=X_pm1.dtype)
-        return X_pm1[:, :, S].prod(dim=2).to(X_pm1.dtype)
-    else:
-        raise ValueError("X must be (P,d) or (E,P,d)")
+# -------- single-index Hermite teacher (batched for E exps) --------
 
-def parse_sets(spec: str) -> List[List[int]]:
-    import re
-    blocks = re.findall(r"\{([^}]*)\}", spec)
-    out = []
-    for s in blocks:
-        toks = [t.strip() for t in s.split(",") if t.strip()!=""]
-        out.append(sorted(map(int, toks)))
-    if not out: raise ValueError("bad teacher spec")
-    return out
+def _hermite_he(z: torch.Tensor, n: int) -> torch.Tensor:
+    """Probabilists' Hermite polynomials He_n(z): He_0=1, He_1=z, He_{n+1}=z*He_n - n*He_{n-1}."""
+    if n < 0:
+        raise ValueError("Hermite degree n must be >= 0")
+    if n == 0:
+        return torch.ones_like(z)
+    if n == 1:
+        return z
+    He_nm1 = torch.ones_like(z)   # He_0
+    He_n_  = z                    # He_1
+    for k in range(1, n):
+        He_np1 = z * He_n_ - k * He_nm1
+        He_nm1, He_n_ = He_n_, He_np1
+    return He_n_
 
-def generate_parity_multi(P: int, d: int, sets: List[torch.Tensor], E: int,
-                          data_seeds: List[int], device, dtype) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Generate E independent parity datasets in ±1 coding.
-    Returns X ∈ ℝ[E,P,d], y ∈ ℝ[E,P,1]."""
+def generate_single_index_hermite_multi(
+    P: int, d: int, k: int, E: int,
+    data_seeds: List[int], device, dtype,
+    hermite_degree: int = 5, random_support: bool = True
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Generate E independent datasets for a single-index model:
+      X ~ N(0, I_d), choose support S of size k (random per exp by default),
+      w_i = 1/sqrt(k) on S else 0, z = X @ w, y = He_p(z) (continuous labels).
+    Returns:
+      X ∈ ℝ[E,P,d], y ∈ ℝ[E,P,1], W ∈ ℝ[E,d] (teacher vectors per experiment).
+    """
     assert len(data_seeds) == E
-    Xs, ys = [], []
+    Xs, ys, Ws = [], [], []
     for e in range(E):
         g = torch.Generator(device=device).manual_seed(int(data_seeds[e]))
-        Xe = (torch.randint(0,2,(P,d),generator=g,device=device,dtype=torch.int8).to(dtype) * 2.0 - 1.0)
-        Ccols = [parity_character(Xe, S) for S in sets]
-        Ce = torch.stack(Ccols, dim=1) if Ccols else torch.zeros(P,0,device=device, dtype=dtype)
-        ye = Ce.sum(dim=1, keepdim=True)
-        Xs.append(Xe); ys.append(ye)
-    X = torch.stack(Xs, dim=0)
-    y = torch.stack(ys, dim=0)
-    return X, y
+        # support
+        if k > d:
+            raise ValueError("k cannot exceed d")
+        if k > 0:
+            if random_support:
+                idx = torch.randperm(d, generator=g, device=device)[:k]
+            else:
+                idx = torch.arange(k, device=device)
+        # teacher vector
+        we = torch.zeros(d, device=device, dtype=dtype)
+        if k > 0:
+            we[idx] = 1.0 / math.sqrt(k)
+
+        Xe = torch.randn(P, d, generator=g, device=device, dtype=dtype)
+        ze = Xe @ we
+        gz = _hermite_he(ze, hermite_degree)
+        ye = gz.unsqueeze(1)  # continuous labels
+
+        Xs.append(Xe); ys.append(ye); Ws.append(we)
+    X = torch.stack(Xs, dim=0)            # (E,P,d)
+    y = torch.stack(ys, dim=0)            # (E,P,1)
+    W = torch.stack(Ws, dim=0)            # (E,d)
+    return X, y, W
 
 # ----------------------------- config -----------------------------
 
@@ -76,6 +96,7 @@ class Model:
     gamma: float = 0.5
     sigma_a: float = 1.0
     sigma_w: float = 1.0
+    sigma_b: float = 1.0   # std for hidden bias prior
     act: str = "relu"
 
 @dataclass
@@ -107,6 +128,9 @@ class Algo:
     max_abs_a: Optional[float] = None
     max_l2_w: Optional[float] = None
     max_l2_a: Optional[float] = None
+    # clamps for bias
+    max_abs_b: Optional[float] = None
+    max_l2_b: Optional[float] = None
     nan_reinit_std_scale: float = 1.0
     log_bad_counts: bool = True
 
@@ -120,64 +144,73 @@ class Algo:
     early_stop_use_rho: bool = False
     early_stop_rho_epsilon: float = 1e-3
 
-    # NEW: independent test-MSE early stop (immediate)
+    # independent test-MSE early stop (use FULL eval set)
     early_stop_test_mse_enabled: bool = True
     early_stop_test_mse_threshold: float = 0.01
-    test_mse_check_every: int = 1          # check every outer iter by default
-    test_mse_use_small_eval: bool = True   # use the small eval set for speed
+    test_mse_check_every: int = 1
+    test_mse_use_small_eval: bool = False  # we will always use the full eval set
 
-    # NEW: optional η ∝ κ
-    linear_kappa_step: bool = False  # if True, eta = step_size * kappa
+    # optional η ∝ κ
+    linear_kappa_step: bool = False
 
-    # NEW: power-2 learning-rate decay schedule
+    # power-2 learning-rate decay schedule
     use_lr_decay: bool = False
-    lr_start: Optional[float] = None   # if None, defaults to step_size
-    lr_end: Optional[float] = None     # if None, defaults to step_size
-    lr_decay_iters: int = 0            # number of outer iterations over which decay applies
+    lr_start: Optional[float] = None
+    lr_end: Optional[float] = None
+    lr_decay_iters: int = 0
 
-    # --------- NEW: SGLD inner steps schedule ----------
-    K0: int = 8           # starting inner steps
-    Kmin: int = 3         # min inner steps
-    K_decay: int = 50_000 # iterations to decay K0 -> Kmin
+    # SGLD inner steps schedule
+    K0: int = 8
+    Kmin: int = 3
+    K_decay: int = 50_000
 
-    # --------- NEW: Anderson acceleration --------------
+    # Anderson acceleration
     use_anderson: bool = True
     aa_depth: int = 3
     aa_reg: float = 1e-8
-    aa_every: int = 1     # apply AA every N outer steps
+    aa_every: int = 1
 
-    # --------- NEW: Eval/log slimming ------------------
-    P_eval_full: int = 100_000         # big eval set (run at ES/final)
-    P_eval_routine: int = 32_768       # cheap routine eval set
-    save_every_logs: int = 10          # write JSON every N log events
+    # Eval/log slimming
+    P_eval_full: int = 100_000
+    P_eval_routine: int = 32_768
+    save_every_logs: int = 10
 
 # ----------------------------- core ------------------------------
 
 class RSCavityExplicitMulti:
     def __init__(self, mdl: Model, algo: Algo, kappa: float, device: torch.device,
                  E: int, seeds_params: List[int],
-                 teacher_sets: Optional[List[torch.Tensor]] = None,
-                 ard: Optional[ARD] = None):
+                 ard: Optional[ARD] = None,
+                 # teacher info
+                 teacher_ws: Optional[torch.Tensor] = None,
+                 hermite_degree: int = 5,
+                 k_support: int = 0):
         self.mdl, self.algo, self.kappa = mdl, algo, float(kappa)
         self.device = device
-        self.sets = teacher_sets or []
         self.ard = ard or ARD()
         self.dtype = torch.float64 if algo.use_float64 else torch.float32
         self.E = int(E)
         assert len(seeds_params) == E
 
+        # Keep teacher (for eval label generation)
+        self.teacher_ws = teacher_ws  # (E,d) or None
+        self.hermite_degree = int(hermite_degree)
+        self.k_support = int(k_support)
+
         # Temperature to match "code 2"
         self.T = 2.0 * (self.kappa ** 2)
 
         # parameters (master in self.dtype)
-        W_list, a_list = [], []
+        W_list, a_list, b_list = [], [], []
         for e in range(E):
             g = torch.Generator(device=device).manual_seed(int(seeds_params[e]))
             We = torch.randn(mdl.B, mdl.d, generator=g, device=device, dtype=self.dtype) * (mdl.sigma_w / math.sqrt(mdl.d))
             ae = torch.randn(mdl.B, 1, generator=g, device=device, dtype=self.dtype) * mdl.sigma_a
-            W_list.append(We); a_list.append(ae)
+            be = torch.randn(mdl.B, 1, generator=g, device=device, dtype=self.dtype) * mdl.sigma_b
+            W_list.append(We); a_list.append(ae); b_list.append(be)
         self.W = torch.stack(W_list, dim=0)  # (E,B,d)
         self.a = torch.stack(a_list, dim=0)  # (E,B,1)
+        self.b = torch.stack(b_list, dim=0)  # (E,B,1)
 
         # ARD
         rho0 = (mdl.d / (mdl.sigma_w**2))
@@ -186,7 +219,7 @@ class RSCavityExplicitMulti:
 
         # constants
         self.N_gamma = self.mdl.N ** self.mdl.gamma
-        # [FIX] unified mean-field scale valid for general B (matches Code 2 when B=N)
+        # unified mean-field scale valid for general B (matches Code 2 when B=N)
         self.scale_f = (self.mdl.N ** (1.0 - self.mdl.gamma)) / float(self.mdl.B)
 
         # fast matmuls
@@ -198,14 +231,15 @@ class RSCavityExplicitMulti:
         except Exception:
             pass
 
-        # ---- Autocast control ----
+        # Autocast control
         self.autocast_enabled = (self.device.type == "cuda") and (not self.algo.use_float64)
         self._autocast_dtype = torch.bfloat16
 
-        # ---- Preallocated buffers for stats/grads ----
+        # Preallocated buffers for stats/grads
         self._buf_C1 = torch.empty(self.E, self.mdl.B, device=self.device, dtype=self.dtype)
         self._buf_C2 = torch.empty_like(self._buf_C1)
         self._buf_G  = torch.empty(self.E, self.mdl.B, self.mdl.d, device=self.device, dtype=self.dtype)
+        self._buf_Hb = torch.empty(self.E, self.mdl.B, device=self.device, dtype=self.dtype)
 
         # last-step C2 stats for logging
         self._last_c2_mean = 0.0
@@ -214,11 +248,11 @@ class RSCavityExplicitMulti:
         # small P heuristic toggle set in run()
         self._smallP = False
 
-        # ---- Cheap held-out eval set (pre-generate once) ----
+        # Held-out eval sets (pre-generate once)
         self._X_eval_small = None
-        self._y_eval_small = None  # labels for small eval set (for test-MSE stop)
+        self._y_eval_small = None
         self._X_eval_full = None
-        self._y_eval_full = None   # labels for full eval set (optional)
+        self._y_eval_full = None
         self._make_eval_sets()
 
         # Counters for buffered saving
@@ -236,20 +270,20 @@ class RSCavityExplicitMulti:
     # ---------- helpers ----------
 
     def _make_eval_sets(self):
-        """Pre-generate and cache routine (small) eval X (and y if teacher sets available).
-        Defer full eval X until needed."""
+        """Pre-generate and cache routine (small) eval X and y based on the Hermite teacher."""
         d = self.mdl.d
         P_small = self.algo.P_eval_routine
         g_base = 987654321
         Xs = []; Ys = []
         for e in range(self.E):
             g = torch.Generator(device=self.device).manual_seed(g_base + e)
-            Xe = (torch.randint(0,2,(P_small,d),generator=g,device=self.device,dtype=torch.int8).to(self.dtype) * 2.0 - 1.0)
+            Xe = torch.randn(P_small, d, generator=g, device=self.device, dtype=self.dtype)
             Xs.append(Xe)
-            if len(self.sets) > 0:
-                Ccols = [parity_character(Xe, S) for S in self.sets]
-                Ce = torch.stack(Ccols, dim=1) if Ccols else torch.zeros(P_small,0,device=self.device, dtype=self.dtype)
-                Ye = Ce.sum(dim=1, keepdim=True)
+            if self.teacher_ws is not None:
+                we = self.teacher_ws[e].to(self.dtype)
+                ze = Xe @ we
+                gz = _hermite_he(ze, self.hermite_degree)
+                Ye = gz.unsqueeze(1)
                 Ys.append(Ye)
         self._X_eval_small = torch.stack(Xs, dim=0)
         self._y_eval_small = torch.stack(Ys, dim=0) if Ys else None
@@ -263,12 +297,13 @@ class RSCavityExplicitMulti:
         Xs = []; Ys = []
         for e in range(self.E):
             g = torch.Generator(device=self.device).manual_seed(g_base + e)
-            Xe = (torch.randint(0,2,(P_full,d),generator=g,device=self.device,dtype=torch.int8).to(self.dtype) * 2.0 - 1.0)
+            Xe = torch.randn(P_full, d, generator=g, device=self.device, dtype=self.dtype)
             Xs.append(Xe)
-            if len(self.sets) > 0:
-                Ccols = [parity_character(Xe, S) for S in self.sets]
-                Ce = torch.stack(Ccols, dim=1) if Ccols else torch.zeros(P_full,0,device=self.device, dtype=self.dtype)
-                Ye = Ce.sum(dim=1, keepdim=True)
+            if self.teacher_ws is not None:
+                we = self.teacher_ws[e].to(self.dtype)
+                ze = Xe @ we
+                gz = _hermite_he(ze, self.hermite_degree)
+                Ye = gz.unsqueeze(1)
                 Ys.append(Ye)
         self._X_eval_full = torch.stack(Xs, dim=0)
         self._y_eval_full = torch.stack(Ys, dim=0) if Ys else None
@@ -278,6 +313,7 @@ class RSCavityExplicitMulti:
         if not mask.any(): return 0
         sw = self.mdl.sigma_w * self.algo.nan_reinit_std_scale
         sa = self.mdl.sigma_a * self.algo.nan_reinit_std_scale
+        sb = self.mdl.sigma_b * self.algo.nan_reinit_std_scale
         total = 0
         for e in range(self.E):
             m = mask[e]
@@ -286,6 +322,7 @@ class RSCavityExplicitMulti:
                 g = torch.Generator(device=self.device).manual_seed(int(17_123 + e))
                 self.W[e, m] = torch.randn(n, self.mdl.d, generator=g, device=self.device, dtype=self.dtype) * (sw / math.sqrt(self.mdl.d))
                 self.a[e, m] = torch.randn(n, 1, generator=g, device=self.device, dtype=self.dtype) * sa
+                self.b[e, m] = torch.randn(n, 1, generator=g, device=self.device, dtype=self.dtype) * sb
         return total
 
     @torch.no_grad()
@@ -296,10 +333,15 @@ class RSCavityExplicitMulti:
             self.a.clamp_(-self.algo.max_abs_a, self.algo.max_abs_a)
         if self.algo.max_l2_w is not None:
             norms = torch.linalg.vector_norm(self.W, dim=2, keepdim=True) + 1e-12
-            self.W.mul_(torch.clamp(self.algo.max_l2_w / norms, max=1.0))
+            self.W.mul_((torch.clamp(self.algo.max_l2_w / norms, max=1.0)))
         if self.algo.max_l2_a is not None:
             norms = torch.sqrt((self.a*self.a).sum(dim=2, keepdim=True)) + 1e-12
             self.a.mul_((torch.clamp(self.algo.max_l2_a / norms, max=1.0)))
+        if self.algo.max_abs_b is not None:
+            self.b.clamp_(-self.algo.max_abs_b, self.algo.max_abs_b)
+        if self.algo.max_l2_b is not None:
+            norms = torch.sqrt((self.b*self.b).sum(dim=2, keepdim=True)) + 1e-12
+            self.b.mul_((torch.clamp(self.algo.max_l2_b / norms, max=1.0)))
 
     @staticmethod
     def _batched_mm_X_Wt(X: torch.Tensor, W: torch.Tensor) -> torch.Tensor:
@@ -307,8 +349,8 @@ class RSCavityExplicitMulti:
 
     def _scheduled_eta(self, it: int, P: int) -> float:
         """
-        [FIX] Learning-rate schedule now explicitly matches Code 2's poly-decay (power=2):
-              η_t = η_end + (η_start - η_end) * (1 - min(t, K)/K)^2
+        Learning-rate schedule: power-2 poly-decay
+        η_t = η_end + (η_start - η_end) * (1 - min(t, K)/K)^2
         """
         base = self.algo.step_size * (self.kappa**2 if self.algo.linear_kappa_step else 1.0)
         if self.algo.use_lr_decay and self.algo.lr_decay_iters > 0:
@@ -338,18 +380,18 @@ class RSCavityExplicitMulti:
                                 return_field: bool = False):
         """
         Returns:
-          grad_w_U, grad_a_U, optional f(x)
+          grad_w_U, grad_a_U, grad_b_U, optional f(x)
         Where:
-          ∇U = [ T * prior-gradient ] + [ data-gradient with mean MSE (1/P) ]  # [FIX] matches PyTorch MSE (no 1/2)
+          ∇U = [ T * prior-gradient ] + [ data-gradient with mean MSE (1/P) ]
         """
         Eexp, P, d = X.shape
         B = W.shape[1]
         invP = 1.0 / float(P)
 
         a_flat = a[:, :, 0]                 # (E,B)
+        b_flat = self.b[:, :, 0]            # (E,B)
 
-        # [FIX] Use unified scale s = (N^{1-γ}/B) consistently (general B), instead of 1/N^γ.
-        s = self.scale_f                    # scalar float
+        s = self.scale_f
         a_scaled = a * s                    # (E,B,1)
         a_scaled_T = a_scaled.transpose(1, 2)   # (E,1,B)
 
@@ -357,13 +399,13 @@ class RSCavityExplicitMulti:
         C1 = self._buf_C1.zero_()           # (E,B)   accumulates Σ Φ^T r
         C2 = self._buf_C2.zero_()           # (E,B)   accumulates Σ φ^2 per particle
         G  = self._buf_G.zero_()            # (E,B,d) accumulates w-gradient
+        Hb = self._buf_Hb.zero_()           # (E,B)   accumulates b-gradient (data term)
         f_acc = None
         if return_field:
             f_acc = torch.zeros(Eexp, P, device=self.device, dtype=self.dtype)
 
         step = self.algo.P_chunk_train or P
 
-        # autocast for heavy blocks
         ctx = torch.autocast(self.device.type, dtype=self._autocast_dtype, enabled=self.autocast_enabled)
         with ctx:
             for start in range(0, P, step):
@@ -372,6 +414,7 @@ class RSCavityExplicitMulti:
                 rc = r[:, start:start+n, :].contiguous()
 
                 Z   = self._batched_mm_X_Wt(Xc, W.contiguous())    # (E,n,B)
+                Z   = Z + self.b.transpose(1, 2)                   # (E,1,B)
                 Phi = activation(Z, self.mdl.act)                  # (E,n,B)
 
                 if self.mdl.act == "relu":
@@ -385,10 +428,10 @@ class RSCavityExplicitMulti:
                 C1 += torch.bmm(Phi.transpose(1, 2).contiguous(), rc).squeeze(-1)  # Σ Φ^T r
                 C2 += (Phi * Phi).sum(dim=1)                                      # Σ φ^2
 
-                # [FIX] Data gradient wrt w for mean MSE (1/P), with factor 2 and general-B scaling s
-                # M corresponds to (rc - s*Phi*a) * φ'(Z) * (s*a)
+                # data gradient wrt w for mean MSE (1/P)
                 M = (rc - a_scaled_T * Phi) * dPhi * a_scaled_T                   # (E,n,B)
                 G += torch.bmm(M.transpose(1, 2).contiguous(), Xc) * (-2.0 * invP)
+                Hb += M.sum(dim=1).to(self.dtype) * (-2.0 * invP)
 
                 if return_field:
                     fa = torch.bmm(Phi, a)  # (E,n,1)
@@ -396,28 +439,32 @@ class RSCavityExplicitMulti:
 
         # store means for diagnostics
         self._last_c2_mean = float(C2.mean().item())
-        self._last_c2eff_mean = float(C2.mean().item())  # no reaction => same
+        self._last_c2eff_mean = float(C2.mean().item())
 
-        # ---- GRADIENTS OF U ----
+        # GRADIENTS OF U
         term1_a_priorU = (self.T / (self.mdl.sigma_a**2)) * a_flat
-        # [FIX] mean MSE (1/P) => factor 2 in data terms; use s and s^2 (general B)
         term2_a_dataU  = - 2.0 * C1 * (invP * s)
         term3_a_dataU  = + 2.0 * (C2 * (invP * (s * s))) * a_flat
         grad_a_U  = (term1_a_priorU + term2_a_dataU + term3_a_dataU).unsqueeze(2).to(self.dtype)
 
-        # [unchanged] prior term for W still uses ARD precision ρ; data part already fixed above
         grad_w_U = (G + (self.T) * W * self.rho.unsqueeze(1)).to(self.dtype)
+
+        term1_b_priorU = (self.T / (self.mdl.sigma_b**2)) * b_flat
+        term2_b_dataU  = Hb
+        grad_b_U = (term1_b_priorU + term2_b_dataU).unsqueeze(2).to(self.dtype)  # (E,B,1)
 
         # clip
         if self.algo.grad_clip_norm is not None:
             gw2 = (grad_w_U * grad_w_U).sum(dim=2, keepdim=True)
             ga2 = (grad_a_U * grad_a_U).sum(dim=2, keepdim=True)
-            gn = torch.sqrt(gw2 + ga2) + 1e-12
+            gb2 = (grad_b_U * grad_b_U).sum(dim=2, keepdim=True)
+            gn = torch.sqrt(gw2 + ga2 + gb2) + 1e-12
             scale = torch.clamp(self.algo.grad_clip_norm / gn, max=1.0)
             grad_w_U = grad_w_U * scale
             grad_a_U = grad_a_U * scale
+            grad_b_U = grad_b_U * scale
 
-        return grad_w_U, grad_a_U, (f_acc.unsqueeze(-1) if return_field else None)
+        return grad_w_U, grad_a_U, grad_b_U, (f_acc.unsqueeze(-1) if return_field else None)
 
     @torch.no_grad()
     def _field_from_particles_stream(self, X: torch.Tensor) -> torch.Tensor:
@@ -430,35 +477,79 @@ class RSCavityExplicitMulti:
                 n = min(step, P - start)
                 Xc = X[:, start:start+n, :].contiguous()
                 Z  = self._batched_mm_X_Wt(Xc, self.W.contiguous())
+                Z  = Z + self.b.transpose(1, 2)
                 Phi = activation(Z, self.mdl.act)
                 fa = torch.bmm(Phi, self.a)
-                # [consistent] forward uses same general-B scale
                 f[:, start:start+n] = (self.scale_f * fa.squeeze(-1)).to(self.dtype)
         return f.unsqueeze(-1)
+
+    # ---------------- Label-aware evaluation ----------------
+
+    @torch.no_grad()
+    def _eval_on_X(self, X_eval: torch.Tensor, y_eval: Optional[torch.Tensor] = None) -> Dict[str, Any]:
+        """Evaluate on provided X_eval (shape E,P_eval,d).
+           If y_eval is provided, compute MSE vs labels.
+           Otherwise, report 0.5 * E[f^2] as 'half_f2'.
+        """
+        Eexp, P_eval, _ = X_eval.shape
+        scale = self.scale_f
+        a = self.a.detach()
+
+        # accumulators
+        if y_eval is not None:
+            mse_sum = torch.zeros(Eexp, device=self.device, dtype=self.dtype)
+        else:
+            f2_sum = torch.zeros(Eexp, device=self.device, dtype=self.dtype)
+
+        step = max(1, self.algo.batch_eval)
+        for start in range(0, P_eval, step):
+            n = min(step, P_eval-start)
+            Xc = X_eval[:, start:start+n, :].contiguous()
+            Z = self._batched_mm_X_Wt(Xc, self.W.contiguous())
+            Z = Z + self.b.transpose(1, 2)
+            Phi = activation(Z, self.mdl.act)
+            f = (scale * torch.bmm(Phi, a).squeeze(-1))  # (E,n)
+
+            if y_eval is not None:
+                ye = y_eval[:, start:start+n, 0].to(self.dtype)
+                diff = f - ye
+                mse_sum += (diff * diff).sum(dim=1)
+            else:
+                f2_sum += (f * f).sum(dim=1)
+
+        invP = 1.0 / float(P_eval)
+        if y_eval is not None:
+            mse_per_exp = mse_sum * invP
+            return {
+                'mse_per_exp': mse_per_exp.tolist(),
+                'mse': float(mse_per_exp.mean().item()),
+                'rmse': float(torch.sqrt(mse_per_exp.mean()).item()),
+            }
+        else:
+            half_f2_per_exp = 0.5 * (f2_sum * invP)
+            return {
+                'half_f2_per_exp': half_f2_per_exp.tolist(),
+                'half_f2': float(half_f2_per_exp.mean().item()),
+            }
 
     # ---------------- SGLD ----------------
 
     @torch.no_grad()
     def _sgld_inner(self, X: torch.Tensor, r: torch.Tensor, eta: float, return_field: bool = False):
-        """One inner SGLD step. Optionally piggybacks the field on the last step.
-
-        Args:
-            X, r: training inputs and residual.
-            eta: step size.
-            return_field: if True, also compute and return f(X) for current params.
-        Returns:
-            f_acc: (E,P,1) field if return_field is True, else None.
-        """
-        gw, ga, f_acc = self._stats_and_grads_stream(X, r, self.W, self.a, return_field=return_field)
+        """One inner SGLD step. Optionally piggybacks the field on the last step."""
+        gw, ga, gb, f_acc = self._stats_and_grads_stream(X, r, self.W, self.a, return_field=return_field)
         self.W.add_(gw, alpha=-eta)
         self.a.add_(ga, alpha=-eta)
+        self.b.add_(gb, alpha=-eta)
+
         # noise std = sqrt(2*T*eta)
         nstd = math.sqrt(2.0*self.T*eta)
         self.W.add_(torch.randn_like(self.W, dtype=self.dtype), alpha=nstd)
         self.a.add_(torch.randn_like(self.a, dtype=self.dtype), alpha=nstd)
+        self.b.add_(torch.randn_like(self.b, dtype=self.dtype), alpha=nstd)
 
         if self.algo.kill_nan_particles:
-            bad_now = ~torch.isfinite(self.W).all(dim=2) | ~torch.isfinite(self.a).all(dim=2)
+            bad_now = (~torch.isfinite(self.W).all(dim=2)) | (~torch.isfinite(self.a).all(dim=2)) | (~torch.isfinite(self.b).all(dim=2))
             if bad_now.any():
                 self._reinit_particles(bad_now)
 
@@ -476,124 +567,35 @@ class RSCavityExplicitMulti:
         rho_hat = torch.clamp(rho_hat, min=self.ard.rho_min, max=self.ard.rho_max)
         self.rho.mul_(1.0 - self.ard.ema).add_(rho_hat, alpha=self.ard.ema)
 
-    # ---------------- Held-out eval ----------------
-
-    @torch.no_grad()
-    def _eval_on_X(self, X_eval: torch.Tensor) -> Dict[str, Any]:
-        """Evaluate metrics on provided X_eval (shape E,P_eval,d)."""
-        d = self.mdl.d
-        Eexp, P_eval, _ = X_eval.shape
-        M = len(self.sets)
-        f2_sum = torch.zeros(Eexp, device=self.device, dtype=self.dtype)
-        v_list = torch.zeros(Eexp, M, device=self.device, dtype=self.dtype) if M>0 else None
-        G_list = torch.zeros(Eexp, M, M, device=self.device, dtype=self.dtype) if M>0 else None
-
-        scale = self.scale_f
-        a = self.a.detach()
-
-        step = max(1, self.algo.batch_eval)
-        for start in range(0, P_eval, step):
-            n = min(step, P_eval-start)
-            Xc = X_eval[:, start:start+n, :].contiguous()
-            Z = self._batched_mm_X_Wt(Xc, self.W.contiguous())
-            Phi = activation(Z, self.mdl.act)
-            f = (scale * torch.bmm(Phi, a).squeeze(-1))
-            f2_sum += (f*f).sum(dim=1)
-
-            if M>0:
-                for e in range(Eexp):
-                    Ccols = [parity_character(Xc[e], S) for S in self.sets]
-                    C = torch.stack(Ccols, dim=1)
-                    v_list[e] += C.t().matmul(f[e])
-                    G_list[e] += C.t().matmul(C)
-
-        invP_eval = 1.0/float(P_eval)
-        f2_bar = f2_sum * invP_eval
-        out = {
-            'half_mse_empirical_per_exp': (0.5*f2_bar).tolist(),
-            'half_mse_total_ms_per_exp': (0.5*f2_bar).tolist(),
-            'half_mse_modes_per_exp': [0.0]*Eexp,
-            'half_noise_per_exp': (0.5*f2_bar).tolist(),
-        }
-        if M==0:
-            mean_val = float((0.5*f2_bar).mean().item())
-            out.update(
-                half_mse_empirical=mean_val, half_mse_total_ms=mean_val,
-                half_mse_modes=0.0, half_noise=mean_val,
-                m_S_per_exp=[[] for _ in range(Eexp)], m_S=[]
-            ); return out
-
-        half_modes = []; half_noise = []; half_total = []; half_emp = []; m_S_per_exp = []
-        ones = torch.ones(M, device=self.device, dtype=self.dtype)
-        for e in range(Eexp):
-            v = v_list[e] * invP_eval; G = G_list[e] * invP_eval
-            m_S = v; m_S_per_exp.append(m_S.detach().cpu().tolist())
-            mTm = float((m_S*m_S).sum().item())
-            mTGm = float(m_S.view(1,-1).matmul(G).matmul(m_S.view(-1,1)).item())
-            noise = float(f2_bar[e].item()) - 2.0*mTm + mTGm
-            half_modes.append(0.5*float(((1.0-m_S)**2).sum().item()))
-            half_noise.append(0.5*float(noise))
-            half_total.append(half_modes[-1] + half_noise[-1])
-            half_emp.append(0.5*(float(f2_bar[e].item()) - 2.0*float(ones.dot(v).item())
-                                 + float(ones.view(1,-1).matmul(G).matmul(ones.view(-1,1)).item())))
-
-        m_arr = np.array(m_S_per_exp, dtype=float) if m_S_per_exp else np.zeros((Eexp,0))
-        m_mean = m_arr.mean(axis=0).tolist() if m_arr.size>0 else []
-        out.update(
-            half_mse_modes_per_exp=half_modes,
-            half_noise_per_exp=half_noise,
-            half_mse_total_ms_per_exp=half_total,
-            half_mse_empirical_per_exp=half_emp,
-            half_mse_modes=float(np.mean(half_modes)),
-            half_noise=float(np.mean(half_noise)),
-            half_mse_total_ms=float(np.mean(half_total)),
-            half_mse_empirical=float(np.mean(half_emp)),
-            m_S_per_exp=m_S_per_exp,
-            m_S=m_mean,
-        )
-        return out
-
     # ---------------- Anderson acceleration ----------------
 
     @torch.no_grad()
     def _anderson_update(self, f_prev: torch.Tensor, f_new: torch.Tensor,
                          aa_hist: List[torch.Tensor], g_hist: List[torch.Tensor]) -> Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor]]:
-        """
-        Walker-Ni Anderson (type-I/II hybrid): use differences of residuals to build a tiny LS problem.
-        f_prev: current estimate (E,P,1); f_new = G(f_prev).
-        aa_hist: list of past residuals r_i = f_i_new - f_i (flattened).
-        g_hist: list of past g_i = f_i_new (flattened).
-        """
+        """Walker-Ni Anderson acceleration."""
         if not self.algo.use_anderson or self.algo.aa_depth <= 0:
             return f_new, aa_hist, g_hist
 
-        # residual at k
         r_k = (f_new - f_prev).detach().reshape(-1)
         g_k = f_new.detach().reshape(-1)
 
-        # append
         aa_hist.append(r_k)
         g_hist.append(g_k)
         if len(aa_hist) <= 1:
-            # not enough history
             if len(aa_hist) > self.algo.aa_depth:
                 aa_hist.pop(0); g_hist.pop(0)
             return f_new, aa_hist, g_hist
 
         m = min(self.algo.aa_depth, len(aa_hist)-1)
-        # use last m+1 residuals
         R_cols = []
         G_cols = []
         for i in range(-m-1, -1):
             R_cols.append(aa_hist[i])
             G_cols.append(g_hist[i])
-        R = torch.stack(R_cols, dim=1)   # [n, m+1]
-        # differences
-        dR = R[:, 1:] - R[:, :-1]        # [n, m]
-        dG = torch.stack(G_cols, dim=1)[:, 1:] - torch.stack(G_cols, dim=1)[:, :-1]  # [n, m]
+        R = torch.stack(R_cols, dim=1)
+        dR = R[:, 1:] - R[:, :-1]
+        dG = torch.stack(G_cols, dim=1)[:, 1:] - torch.stack(G_cols, dim=1)[:, :-1]
 
-        # Solve (dR^T dR + λI) * alpha = dR^T r_k
-        # alpha shape [m]
         lam = self.algo.aa_reg
         Gram = dR.T @ dR
         rhs  = dR.T @ r_k
@@ -603,11 +605,9 @@ class RSCavityExplicitMulti:
         except RuntimeError:
             alpha = torch.zeros(rhs.shape, device=self.device, dtype=rhs.dtype)
 
-        # accelerated update: f_{k+1} = g_k - dG * alpha
         g_next = g_k - (dG @ alpha)
         f_next = g_next.reshape_as(f_new)
 
-        # trim history
         if len(aa_hist) > self.algo.aa_depth + 1:
             aa_hist.pop(0); g_hist.pop(0)
 
@@ -626,18 +626,14 @@ class RSCavityExplicitMulti:
         self._smallP = (P <= 100)
 
         hist = {
-            "iter": [], "train_mse": [], "train_mse_per_exp": [],
-            "half_mse_modes": [], "half_noise": [],
-            "half_mse_total_ms": [], "half_mse_empirical": [], "m_S": [],
-            "half_mse_modes_per_exp": [], "half_noise_per_exp": [],
-            "half_mse_total_ms_per_exp": [], "half_mse_empirical_per_exp": [], "m_S_per_exp": [],
+            "iter": [],
+            "train_mse": [], "train_mse_per_exp": [],
+            "eval_mse_small": [], "eval_mse_small_per_exp": [],
+            "eval_mse_full": [], "eval_mse_full_per_exp": [],
             "rho_min": [], "rho_max": [], "elapsed_s": [],
-            "bad_prop": [], "bad_reset": [], "dtype": str(self.dtype),
             "c2_mean": [], "c2_eff_mean": [],
             "fp_residual": [], "fp_residual_per_exp": [],
-            "rho_delta_rel": [],
-            "eta": [], "K": [],
-            "test_mse_small": [],
+            "rho_delta_rel": [], "eta": [], "K": [],
         }
         t0 = time.time()
 
@@ -706,54 +702,43 @@ class RSCavityExplicitMulti:
             train_mse_per_e = ((y - f_mean)**2).mean(dim=(1,2))
             train_mse_mean = float(train_mse_per_e.mean().item())
 
-            # -------- independent test-MSE early stop (IMMEDIATE) --------
-            test_es_triggered = False
+            # -------- test-MSE early stop (FULL EVAL SET) --------
             test_mse_val = None
             if (
                 self.algo.early_stop_test_mse_enabled
-                and (len(self.sets) > 0)
-                and (self._X_eval_small is not None)
-                and (self._y_eval_small is not None)
+                and (self._X_eval_small is not None)  # small set exists -> teacher exists
                 and (it % max(1, self.algo.test_mse_check_every) == 0)
             ):
-                f_eval_small = self._field_from_particles_stream(self._X_eval_small)
-                test_mse_val = float(((f_eval_small - self._y_eval_small.to(self.dtype))**2).mean().item())
+                # ensure full set exists
+                self._ensure_full_eval_set()
+                # compute MSE on FULL held-out set with continuous labels
+                ev_full = self._eval_on_X(self._X_eval_full, self._y_eval_full)
+                test_mse_val = ev_full["mse"]
                 if test_mse_val < self.algo.early_stop_test_mse_threshold:
-                    self._ensure_full_eval_set()
-                    ev = self._eval_on_X(self._X_eval_full)
+                    # snapshot with full eval
                     rhomin = float(self.rho.min().item()); rhomax = float(self.rho.max().item())
 
                     hist["iter"].append(it)
                     hist["train_mse"].append(train_mse_mean)
                     hist["train_mse_per_exp"].append(train_mse_per_e.detach().cpu().tolist())
-                    hist["half_mse_modes"].append(ev["half_mse_modes"])
-                    hist["half_noise"].append(ev["half_noise"])
-                    hist["half_mse_total_ms"].append(ev["half_mse_total_ms"])
-                    hist["half_mse_empirical"].append(ev["half_mse_empirical"])
-                    hist["m_S"].append(ev.get("m_S", []))
-                    hist["half_mse_modes_per_exp"].append(ev["half_mse_modes_per_exp"])
-                    hist["half_noise_per_exp"].append(ev["half_noise_per_exp"])
-                    hist["half_mse_total_ms_per_exp"].append(ev["half_mse_total_ms_per_exp"])
-                    hist["half_mse_empirical_per_exp"].append(ev["half_mse_empirical_per_exp"])
-                    hist["m_S_per_exp"].append(ev.get("m_S_per_exp", [[] for _ in range(self.E)]))
+                    hist["eval_mse_full"].append(ev_full["mse"])  # log full-set test error
+                    hist["eval_mse_full_per_exp"].append(ev_full["mse_per_exp"])
                     hist["rho_min"].append(rhomin); hist["rho_max"].append(rhomax)
                     hist["elapsed_s"].append(round(time.time()-t0,2))
-                    hist["bad_prop"].append(0)
-                    hist["bad_reset"].append(0)
                     hist["c2_mean"].append(self._last_c2_mean)
                     hist["c2_eff_mean"].append(self._last_c2eff_mean)
                     hist["fp_residual"].append(fp_residual_mean)
                     hist["fp_residual_per_exp"].append(fp_residual_per_e.detach().cpu().tolist())
                     hist["rho_delta_rel"].append(rho_delta_rel)
                     hist["eta"].append(eta); hist["K"].append(K)
-                    hist["test_mse_small"].append(test_mse_val)
 
                     payload = {
                         "summary": {
                             "train_mse_last": hist["train_mse"][-1],
                             "P_eval_full": self.algo.P_eval_full,
                             "E": self.E,
-                            "early_stop_reason": f"test_mse<{self.algo.early_stop_test_mse_threshold}"
+                            "early_stop_reason": f"test_mse_full<{self.algo.early_stop_test_mse_threshold}",
+                            "test_mse_full": ev_full["mse"],
                         },
                         "traj": hist,
                         "config": {
@@ -764,12 +749,18 @@ class RSCavityExplicitMulti:
                                 "ema": self.ard.ema, "update_every": self.ard.update_every,
                                 "rho_min": self.ard.rho_min, "rho_max": self.ard.rho_max,
                                 "use_ard": self.ard.use_ard
+                            },
+                            "teacher": {
+                                "type": "single_index_hermite",
+                                "k_support": self.k_support,
+                                "hermite_degree": self.hermite_degree,
+                                "support_selection": "random_per_experiment"
                             }
                         }
                     }
                     with open(save_path, "w") as f:
                         json.dump(payload, f, indent=2)
-                    print(f"[early-stop:TEST] it={it} small-eval test_mse={test_mse_val:.6f} < {self.algo.early_stop_test_mse_threshold}. Stopping.")
+                    print(f"[early-stop:TEST] it={it} FULL-eval test_mse={test_mse_val:.6f} < {self.algo.early_stop_test_mse_threshold}. Stopping.")
                     return {"path": save_path, "traj": hist}
 
             # -------- legacy/other early stopping with FP + rho checks --------
@@ -785,41 +776,30 @@ class RSCavityExplicitMulti:
                     best_counter = 0
                 if best_counter >= self.algo.early_stop_patience:
                     self._ensure_full_eval_set()
-                    ev = self._eval_on_X(self._X_eval_full)
+                    ev_full = self._eval_on_X(self._X_eval_full, self._y_eval_full)
                     rhomin = float(self.rho.min().item()); rhomax = float(self.rho.max().item())
 
                     hist["iter"].append(it)
                     hist["train_mse"].append(train_mse_mean)
                     hist["train_mse_per_exp"].append(train_mse_per_e.detach().cpu().tolist())
-                    hist["half_mse_modes"].append(ev["half_mse_modes"])
-                    hist["half_noise"].append(ev["half_noise"])
-                    hist["half_mse_total_ms"].append(ev["half_mse_total_ms"])
-                    hist["half_mse_empirical"].append(ev["half_mse_empirical"])
-                    hist["m_S"].append(ev.get("m_S", []))
-                    hist["half_mse_modes_per_exp"].append(ev["half_mse_modes_per_exp"])
-                    hist["half_noise_per_exp"].append(ev["half_noise_per_exp"])
-                    hist["half_mse_total_ms_per_exp"].append(ev["half_mse_total_ms_per_exp"])
-                    hist["half_mse_empirical_per_exp"].append(ev["half_mse_empirical_per_exp"])
-                    hist["m_S_per_exp"].append(ev.get("m_S_per_exp", [[] for _ in range(self.E)]))
+                    hist["eval_mse_full"].append(ev_full["mse"])
+                    hist["eval_mse_full_per_exp"].append(ev_full["mse_per_exp"])
                     hist["rho_min"].append(rhomin); hist["rho_max"].append(rhomax)
                     hist["elapsed_s"].append(round(time.time()-t0,2))
-                    hist["bad_prop"].append(0)
-                    hist["bad_reset"].append(0)
                     hist["c2_mean"].append(self._last_c2_mean)
                     hist["c2_eff_mean"].append(self._last_c2eff_mean)
                     hist["fp_residual"].append(fp_residual_mean)
                     hist["fp_residual_per_exp"].append(fp_residual_per_e.detach().cpu().tolist())
                     hist["rho_delta_rel"].append(rho_delta_rel)
                     hist["eta"].append(eta); hist["K"].append(K)
-                    if test_mse_val is not None:
-                        hist["test_mse_small"].append(test_mse_val)
 
                     payload = {
                         "summary": {
                             "train_mse_last": hist["train_mse"][-1],
                             "P_eval_full": self.algo.P_eval_full,
                             "E": self.E,
-                            "early_stop_reason": "fp/rho/mse composite"
+                            "early_stop_reason": "fp/rho/mse composite",
+                            "test_mse_full": ev_full["mse"],
                         },
                         "traj": hist,
                         "config": {
@@ -830,6 +810,12 @@ class RSCavityExplicitMulti:
                                 "ema": self.ard.ema, "update_every": self.ard.update_every,
                                 "rho_min": self.ard.rho_min, "rho_max": self.ard.rho_max,
                                 "use_ard": self.ard.use_ard
+                            },
+                            "teacher": {
+                                "type": "single_index_hermite",
+                                "k_support": self.k_support,
+                                "hermite_degree": self.hermite_degree,
+                                "support_selection": "random_per_experiment"
                             }
                         }
                     }
@@ -842,46 +828,38 @@ class RSCavityExplicitMulti:
 
             # Routine logging/eval
             if it % self.algo.log_every == 0:
-                ev = self._eval_on_X(self._X_eval_small)   # cheap eval
-                rhomin = float(self.rho.min().item()); rhomax = float(self.rho.max().item())
+                # cheap small-set eval (if labels exist)
+                ev_small = self._eval_on_X(self._X_eval_small, self._y_eval_small) if (self._y_eval_small is not None) else {"mse": float('nan'), "mse_per_exp": [float('nan')]*self.E}
 
-                # also record small-set test MSE if labels available
-                if (self._y_eval_small is not None):
-                    f_eval_small = self._field_from_particles_stream(self._X_eval_small)
-                    test_mse_small = float(((f_eval_small - self._y_eval_small.to(self.dtype))**2).mean().item())
-                else:
-                    test_mse_small = float('nan')
+                # full-set eval for accurate test error
+                self._ensure_full_eval_set()
+                ev_full = self._eval_on_X(self._X_eval_full, self._y_eval_full) if (self._y_eval_full is not None) else {"mse": float('nan'), "mse_per_exp": [float('nan')]*self.E}
+
+                rhomin = float(self.rho.min().item()); rhomax = float(self.rho.max().item())
 
                 hist["iter"].append(it)
                 hist["train_mse"].append(train_mse_mean)
                 hist["train_mse_per_exp"].append(train_mse_per_e.detach().cpu().tolist())
-                hist["half_mse_modes"].append(ev["half_mse_modes"])
-                hist["half_noise"].append(ev["half_noise"])
-                hist["half_mse_total_ms"].append(ev["half_mse_total_ms"])
-                hist["half_mse_empirical"].append(ev["half_mse_empirical"])
-                hist["m_S"].append(ev.get("m_S", []))
-                hist["half_mse_modes_per_exp"].append(ev["half_mse_modes_per_exp"])
-                hist["half_noise_per_exp"].append(ev["half_noise_per_exp"])
-                hist["half_mse_total_ms_per_exp"].append(ev["half_mse_total_ms_per_exp"])
-                hist["half_mse_empirical_per_exp"].append(ev["half_mse_empirical_per_exp"])
-                hist["m_S_per_exp"].append(ev.get("m_S_per_exp", [[] for _ in range(self.E)]))
+                hist["eval_mse_small"].append(ev_small["mse"])
+                hist["eval_mse_small_per_exp"].append(ev_small["mse_per_exp"])
+                hist["eval_mse_full"].append(ev_full["mse"])
+                hist["eval_mse_full_per_exp"].append(ev_full["mse_per_exp"])
                 hist["rho_min"].append(rhomin); hist["rho_max"].append(rhomax)
                 hist["elapsed_s"].append(round(time.time()-t0,2))
-                hist["bad_prop"].append(0)
-                hist["bad_reset"].append(0)
                 hist["c2_mean"].append(self._last_c2_mean)
                 hist["c2_eff_mean"].append(self._last_c2eff_mean)
                 hist["fp_residual"].append(fp_residual_mean)
                 hist["fp_residual_per_exp"].append(fp_residual_per_e.detach().cpu().tolist())
                 hist["rho_delta_rel"].append(rho_delta_rel)
                 hist["eta"].append(eta); hist["K"].append(K)
-                hist["test_mse_small"].append(test_mse_small)
 
                 payload = {
                     "summary": {
                         "train_mse_last": hist["train_mse"][-1],
                         "P_eval_small": self.algo.P_eval_routine,
-                        "E": self.E
+                        "P_eval_full": self.algo.P_eval_full,
+                        "E": self.E,
+                        "eval_mse_full": ev_full["mse"],
                     },
                     "traj": hist,
                     "config": {
@@ -892,6 +870,12 @@ class RSCavityExplicitMulti:
                             "ema": self.ard.ema, "update_every": self.ard.update_every,
                             "rho_min": self.ard.rho_min, "rho_max": self.ard.rho_max,
                             "use_ard": self.ard.use_ard
+                        },
+                        "teacher": {
+                            "type": "single_index_hermite",
+                            "k_support": self.k_support,
+                            "hermite_degree": self.hermite_degree,
+                            "support_selection": "random_per_experiment"
                         }
                     }
                 }
@@ -899,10 +883,15 @@ class RSCavityExplicitMulti:
                 maybe_save(payload, force=False)
 
                 print(json.dumps({
-                    "iter": it, "mean_train_mse": train_mse_mean,
-                    "B": self.mdl.B, "N": self.mdl.N, "gamma": self.mdl.gamma,
-                    "kappa": self.kappa, "T": self.T,
-                    "rho_min": rhomin, "rho_max": rhomax,
+                    "iter": it,
+                    "mean_train_mse": train_mse_mean,
+                    "B": self.mdl.B,
+                    "N": self.mdl.N,
+                    "gamma": self.mdl.gamma,
+                    "kappa": self.kappa,
+                    "T": self.T,
+                    "rho_min": rhomin,
+                    "rho_max": rhomax,
                     "dtype": "float64" if self.algo.use_float64 else "float32",
                     "elapsed_s": round(time.time()-t0,2),
                     "saved": save_path,
@@ -910,31 +899,23 @@ class RSCavityExplicitMulti:
                     "c2_eff_mean": self._last_c2eff_mean,
                     "fp_residual": fp_residual_mean,
                     "rho_delta_rel": rho_delta_rel,
-                    "eta": eta, "K": K,
-                    "test_mse_small": test_mse_small,
+                    "eta": eta,
+                    "K": K,
+                    "eval_mse_small": ev_small["mse"],
+                    "eval_mse_full": ev_full["mse"],
                 }))
 
         # Final FULL EVAL if not early-stopped
         self._ensure_full_eval_set()
-        ev = self._eval_on_X(self._X_eval_full)
+        ev_full = self._eval_on_X(self._X_eval_full, self._y_eval_full)
         rhomin = float(self.rho.min().item()); rhomax = float(self.rho.max().item())
         hist["iter"].append(it)
         hist["train_mse"].append(float(((y - f_mean)**2).mean().item()))
         hist["train_mse_per_exp"].append(((y - f_mean)**2).mean(dim=(1,2)).detach().cpu().tolist())
-        hist["half_mse_modes"].append(ev["half_mse_modes"])
-        hist["half_noise"].append(ev["half_noise"])
-        hist["half_mse_total_ms"].append(ev["half_mse_total_ms"])
-        hist["half_mse_empirical"].append(ev["half_mse_empirical"])
-        hist["m_S"].append(ev.get("m_S", []))
-        hist["half_mse_modes_per_exp"].append(ev["half_mse_modes_per_exp"])
-        hist["half_noise_per_exp"].append(ev["half_noise_per_exp"])
-        hist["half_mse_total_ms_per_exp"].append(ev["half_mse_total_ms_per_exp"])
-        hist["half_mse_empirical_per_exp"].append(ev["half_mse_empirical_per_exp"])
-        hist["m_S_per_exp"].append(ev.get("m_S_per_exp", [[] for _ in range(self.E)]))
+        hist["eval_mse_full"].append(ev_full["mse"])
+        hist["eval_mse_full_per_exp"].append(ev_full["mse_per_exp"])
         hist["rho_min"].append(rhomin); hist["rho_max"].append(rhomax)
         hist["elapsed_s"].append(round(time.time()-t0,2))
-        hist["bad_prop"].append(0)
-        hist["bad_reset"].append(0)
         hist["c2_mean"].append(self._last_c2_mean)
         hist["c2_eff_mean"].append(self._last_c2eff_mean)
         hist["fp_residual"].append(0.0)
@@ -947,17 +928,29 @@ class RSCavityExplicitMulti:
             "summary": {
                 "train_mse_last": hist["train_mse"][-1],
                 "P_eval_full": self.algo.P_eval_full,
-                "E": self.E
+                "E": self.E,
+                "test_mse_full": ev_full["mse"],
             },
             "traj": hist,
             "config": {
-                "model": self.mdl.__dict__, "algo": self.algo.__dict__,
-                "kappa": self.kappa, "T": self.T,
+                "model": self.mdl.__dict__,
+                "algo": self.algo.__dict__,
+                "kappa": self.kappa,
+                "T": self.T,
                 "ard": {
-                    "alpha0": self.ard.alpha0, "beta0": self.beta0,
-                    "ema": self.ard.ema, "update_every": self.ard.update_every,
-                    "rho_min": self.ard.rho_min, "rho_max": self.ard.rho_max,
+                    "alpha0": self.ard.alpha0,
+                    "beta0": self.beta0,
+                    "ema": self.ard.ema,
+                    "update_every": self.ard.update_every,
+                    "rho_min": self.ard.rho_min,
+                    "rho_max": self.ard.rho_max,
                     "use_ard": self.ard.use_ard
+                },
+                "teacher": {
+                    "type": "single_index_hermite",
+                    "k_support": self.k_support,
+                    "hermite_degree": self.hermite_degree,
+                    "support_selection": "random_per_experiment"
                 }
             }
         }
@@ -1004,7 +997,7 @@ def shard_experiments(exps: List[Dict[str, Any]], num_devices: int, strategy: st
 # ----------------------------- worker ------------------------------
 
 def worker_process(dev_id: int, shard: List[Dict[str, Any]], mdl_dict: Dict[str, Any], algo_dict: Dict[str, Any], ard_dict: Dict[str, Any],
-                   out_dir: str, teacher_sets_spec: str, use_float64: bool):
+                   out_dir: str, hermite_degree: int, k_support: int):
     if torch.cuda.is_available():
         torch.cuda.set_device(dev_id)
         device = torch.device(f"cuda:{dev_id}")
@@ -1015,23 +1008,28 @@ def worker_process(dev_id: int, shard: List[Dict[str, Any]], mdl_dict: Dict[str,
     algo = Algo(**algo_dict)
     ard = ARD(**ard_dict)
 
-    sets = [torch.tensor(s, device=device, dtype=torch.long) for s in parse_sets(teacher_sets_spec)]
-
     for econf in shard:
         P = econf['P']; kappa = econf['kappa']; E = econf['E']
         data_seeds = econf['data_seeds']; param_seeds = econf['param_seeds']
 
-        dtype = torch.float64 if use_float64 else torch.float32
-        X, y = generate_parity_multi(P, mdl.d, sets, E, data_seeds, device, dtype)
+        dtype = torch.float64 if algo.use_float64 else torch.float32
 
-        solver = RSCavityExplicitMulti(mdl, algo, kappa, device, E=E, seeds_params=param_seeds, teacher_sets=sets, ard=ard)
+        # Single-index Hermite data (continuous labels)
+        X, y, W_teacher = generate_single_index_hermite_multi(
+            P, mdl.d, k_support, E, data_seeds, device, dtype, hermite_degree=hermite_degree, random_support=True
+        )
+
+        solver = RSCavityExplicitMulti(
+            mdl, algo, kappa, device, E=E, seeds_params=param_seeds, ard=ard,
+            teacher_ws=W_teacher, hermite_degree=hermite_degree, k_support=k_support
+        )
         tag = f"P{P}_kap{kappa:.3e}"
         dev_tag = f"dev{dev_id}"
         print(f"\n===== RUN start: P={P}, kappa={kappa:.6g}, T={solver.T:.6g}, E={E}, device={device}, dtype={'float64' if algo.use_float64 else 'float32'} =====")
         result = solver.run(X, y, out_dir, tag=tag, dev_tag=dev_tag)
         print(f"===== RUN done: saved -> {result['path']} =====\n")
 
-        del solver, X, y
+        del solver, X, y, W_teacher
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -1040,18 +1038,23 @@ def worker_process(dev_id: int, shard: List[Dict[str, Any]], mdl_dict: Dict[str,
 if __name__ == "__main__":
     set_seed(42)
 
-    teacher_sets_spec = "{0,1,2,3}"
-    d = 35
+    # Teacher settings (single-index Hermite)
+    hermite_degree = 4   # degree p
+    k_support = 2        # number of active coords in the teacher vector
 
-    P_train_list =[500,1000,10000,2133 ,10, 100, 750, 3666, 5000, 7500]
-    kappa_list   =  [1e-1]  #5e-3,7-5e-3,5e-4,1e-3,1e-2,5e-2
-    num_exp = 3
+    d = 18
+
+    P_train_list =  [5000]#[50,100,1000,5000,10000,25000,50000,75000]
+    P_train_list = sorted(P_train_list, reverse=True)
+    kappa_list   = [1e-1]
+    num_exp = 4
     base_seed = 123456
 
     use_float64 = False
-    mdl = Model(d=d, B=512, N=512, gamma=0.5, sigma_a=1.0, sigma_w=1.0, act="relu")
+    mdl = Model(d=d, B=1024, N=1024, gamma=0.5, sigma_a=1.0, sigma_w=0.5, sigma_b=1.0, act="relu")
     algo = Algo(
-        outer_steps=7_500_000,
+        outer_steps=4_000_000,
+
         step_size=1e-2,
         log_every=50_000,            # less frequent logs
         batch_eval=131_072,
@@ -1073,17 +1076,17 @@ if __name__ == "__main__":
         early_stop_use_rho=True,
         early_stop_rho_epsilon=1e-3,
 
-        # --- Independent TEST MSE early stop (new) ---
+        # --- Independent TEST MSE early stop (now uses FULL held-out) ---
         early_stop_test_mse_enabled=True,
         early_stop_test_mse_threshold=0.01,
         test_mse_check_every=5000,
-        test_mse_use_small_eval=True,
+        test_mse_use_small_eval=False,
 
         # --- LR decay (power 2) ---
         use_lr_decay=True,
-        lr_start=1e-3,     # you can set to 1e-3 to mirror Code 2 exactly
-        lr_end=5e-4,       # set to 5e-4 to mirror Code 2 exactly
-        lr_decay_iters=2_000_000,  # set to 2_000_000 to mirror Code 2 exactly
+        lr_start=1e-2,
+        lr_end=5e-4,
+        lr_decay_iters=2_500_000,
 
         # --- Inner SGLD steps schedule ---
         K0=12,
@@ -1091,22 +1094,26 @@ if __name__ == "__main__":
         K_decay=600_000,
 
         # --- Anderson acceleration ---
-        use_anderson=False,
+        use_anderson=True,
         aa_depth=3,
         aa_reg=1e-8,
         aa_every=1,
 
         # --- Eval/log slimming ---
-        P_eval_full=100_000,    # full eval only at ES/final
-        P_eval_routine=32_768,  # cheap routine eval
-        save_every_logs=2,      # write json every 3rd log event
+        P_eval_full=100_000,
+        P_eval_routine=32_768,
+        save_every_logs=2,
+
+        # (optional) clamps for bias if you want them at runtime
+        max_abs_b=None,
+        max_l2_b=None,
     )
-    alpha0 = 4.0
+    alpha0 = 0.1
     beta01 = alpha0 / d
-    ard = ARD(use_ard=False, alpha0=alpha0, ema=0.5, update_every=1,
+    ard = ARD(use_ard=True, alpha0=alpha0, ema=0.5, update_every=1,
               rho_min=0.0, rho_max=1e18, beta0=beta01)
 
-    out_dir = "/home/goring/mean_field_langevin/MCMC_composite/results_d35k4hm_paper_final_ard=no_fin2/1e-1_2"
+    out_dir = "/home/goring/mean_field_langevin/Index/results/2009_MF_d18_k2_p4_a=0.1_correct2_21/1e-1"
     shard_strategy = "round_robin"
 
     os.makedirs(out_dir, exist_ok=True)
@@ -1122,10 +1129,10 @@ if __name__ == "__main__":
                 target=worker_process,
                 args=(dev_id, shards[dev_id],
                       mdl.__dict__, algo.__dict__, ard.__dict__,
-                      out_dir, teacher_sets_spec, algo.use_float64),
+                      out_dir, hermite_degree, k_support),
             )
             p.start(); procs.append(p)
         for p in procs:
             p.join()
     else:
-        worker_process(0, shards[0], mdl.__dict__, algo.__dict__, ard.__dict__, out_dir, teacher_sets_spec, algo.use_float64)
+        worker_process(0, shards[0], mdl.__dict__, algo.__dict__, ard.__dict__, out_dir, hermite_degree, k_support)

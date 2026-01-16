@@ -1,3 +1,4 @@
+
 import os, time, math, json, random
 from dataclasses import dataclass
 from typing import List, Tuple, Dict, Optional, Any
@@ -6,8 +7,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.multiprocessing as mp
-# import torch._dynamo as dynamo
-# dynamo.config.capture_scalar_outputs = True
 
 # ----------------------------- utils -----------------------------
 
@@ -72,8 +71,8 @@ def generate_parity_multi(P: int, d: int, sets: List[torch.Tensor], E: int,
 class Model:
     d: int = 35
     B: int = 16384
-    N: int = 512          # f = (N^{1-γ}/B) * Σ a φ  == (1/N^γ) * Σ a φ if B=N
-    gamma: float = 0.5
+    N: int = 512          # width used for scaling
+    gamma: float = 1.0    # <-- set γ=1.0 for non-lazy (VMS) by default
     sigma_a: float = 1.0
     sigma_w: float = 1.0
     act: str = "relu"
@@ -151,17 +150,28 @@ class Algo:
     P_eval_routine: int = 32_768       # cheap routine eval set
     save_every_logs: int = 10          # write JSON every N log events
 
+@dataclass
+class MFOptions:
+    """Options for explicit mean-field bookkeeping.
+    - compute_mA: whether to compute m_A on the training set at log points.
+    - outlier_topk: if >0, compute simple outlier diagnostics (top-|a| particles).
+    """
+    compute_mA: bool = True
+    outlier_topk: int = 0  # e.g. 4 for quick diagnostics
+
 # ----------------------------- core ------------------------------
 
 class RSCavityExplicitMulti:
     def __init__(self, mdl: Model, algo: Algo, kappa: float, device: torch.device,
                  E: int, seeds_params: List[int],
                  teacher_sets: Optional[List[torch.Tensor]] = None,
-                 ard: Optional[ARD] = None):
+                 ard: Optional[ARD] = None,
+                 mfopts: Optional[MFOptions] = None):
         self.mdl, self.algo, self.kappa = mdl, algo, float(kappa)
         self.device = device
         self.sets = teacher_sets or []
         self.ard = ard or ARD()
+        self.mfopts = mfopts or MFOptions()
         self.dtype = torch.float64 if algo.use_float64 else torch.float32
         self.E = int(E)
         assert len(seeds_params) == E
@@ -186,7 +196,7 @@ class RSCavityExplicitMulti:
 
         # constants
         self.N_gamma = self.mdl.N ** self.mdl.gamma
-        # [FIX] unified mean-field scale valid for general B (matches Code 2 when B=N)
+        # unified mean-field scale valid for general B (equals 1/N^γ when B=N)
         self.scale_f = (self.mdl.N ** (1.0 - self.mdl.gamma)) / float(self.mdl.B)
 
         # fast matmuls
@@ -221,6 +231,10 @@ class RSCavityExplicitMulti:
         self._y_eval_full = None   # labels for full eval set (optional)
         self._make_eval_sets()
 
+        # For cached training set (set in run)
+        self._X_train = None
+        self._y_train = None
+
         # Counters for buffered saving
         self._log_event_count = 0
 
@@ -236,8 +250,6 @@ class RSCavityExplicitMulti:
     # ---------- helpers ----------
 
     def _make_eval_sets(self):
-        """Pre-generate and cache routine (small) eval X (and y if teacher sets available).
-        Defer full eval X until needed."""
         d = self.mdl.d
         P_small = self.algo.P_eval_routine
         g_base = 987654321
@@ -306,10 +318,6 @@ class RSCavityExplicitMulti:
         return torch.bmm(X, W.transpose(1, 2))
 
     def _scheduled_eta(self, it: int, P: int) -> float:
-        """
-        [FIX] Learning-rate schedule now explicitly matches Code 2's poly-decay (power=2):
-              η_t = η_end + (η_start - η_end) * (1 - min(t, K)/K)^2
-        """
         base = self.algo.step_size * (self.kappa**2 if self.algo.linear_kappa_step else 1.0)
         if self.algo.use_lr_decay and self.algo.lr_decay_iters > 0:
             lr0 = self.algo.lr_start if (self.algo.lr_start is not None) else base
@@ -340,7 +348,7 @@ class RSCavityExplicitMulti:
         Returns:
           grad_w_U, grad_a_U, optional f(x)
         Where:
-          ∇U = [ T * prior-gradient ] + [ data-gradient with mean MSE (1/P) ]  # [FIX] matches PyTorch MSE (no 1/2)
+          ∇U = [ T * prior-gradient ] + [ data-gradient with mean MSE (1/P) ]
         """
         Eexp, P, d = X.shape
         B = W.shape[1]
@@ -348,7 +356,7 @@ class RSCavityExplicitMulti:
 
         a_flat = a[:, :, 0]                 # (E,B)
 
-        # [FIX] Use unified scale s = (N^{1-γ}/B) consistently (general B), instead of 1/N^γ.
+        # unified scale s = (N^{1-γ}/B) (general B), instead of 1/N^γ
         s = self.scale_f                    # scalar float
         a_scaled = a * s                    # (E,B,1)
         a_scaled_T = a_scaled.transpose(1, 2)   # (E,1,B)
@@ -363,7 +371,6 @@ class RSCavityExplicitMulti:
 
         step = self.algo.P_chunk_train or P
 
-        # autocast for heavy blocks
         ctx = torch.autocast(self.device.type, dtype=self._autocast_dtype, enabled=self.autocast_enabled)
         with ctx:
             for start in range(0, P, step):
@@ -385,8 +392,6 @@ class RSCavityExplicitMulti:
                 C1 += torch.bmm(Phi.transpose(1, 2).contiguous(), rc).squeeze(-1)  # Σ Φ^T r
                 C2 += (Phi * Phi).sum(dim=1)                                      # Σ φ^2
 
-                # [FIX] Data gradient wrt w for mean MSE (1/P), with factor 2 and general-B scaling s
-                # M corresponds to (rc - s*Phi*a) * φ'(Z) * (s*a)
                 M = (rc - a_scaled_T * Phi) * dPhi * a_scaled_T                   # (E,n,B)
                 G += torch.bmm(M.transpose(1, 2).contiguous(), Xc) * (-2.0 * invP)
 
@@ -394,21 +399,17 @@ class RSCavityExplicitMulti:
                     fa = torch.bmm(Phi, a)  # (E,n,1)
                     f_acc[:, start:start+n] = (self.scale_f * fa.squeeze(-1)).to(self.dtype)
 
-        # store means for diagnostics
         self._last_c2_mean = float(C2.mean().item())
         self._last_c2eff_mean = float(C2.mean().item())  # no reaction => same
 
         # ---- GRADIENTS OF U ----
         term1_a_priorU = (self.T / (self.mdl.sigma_a**2)) * a_flat
-        # [FIX] mean MSE (1/P) => factor 2 in data terms; use s and s^2 (general B)
         term2_a_dataU  = - 2.0 * C1 * (invP * s)
         term3_a_dataU  = + 2.0 * (C2 * (invP * (s * s))) * a_flat
         grad_a_U  = (term1_a_priorU + term2_a_dataU + term3_a_dataU).unsqueeze(2).to(self.dtype)
 
-        # [unchanged] prior term for W still uses ARD precision ρ; data part already fixed above
         grad_w_U = (G + (self.T) * W * self.rho.unsqueeze(1)).to(self.dtype)
 
-        # clip
         if self.algo.grad_clip_norm is not None:
             gw2 = (grad_w_U * grad_w_U).sum(dim=2, keepdim=True)
             ga2 = (grad_a_U * grad_a_U).sum(dim=2, keepdim=True)
@@ -432,23 +433,108 @@ class RSCavityExplicitMulti:
                 Z  = self._batched_mm_X_Wt(Xc, self.W.contiguous())
                 Phi = activation(Z, self.mdl.act)
                 fa = torch.bmm(Phi, self.a)
-                # [consistent] forward uses same general-B scale
                 f[:, start:start+n] = (self.scale_f * fa.squeeze(-1)).to(self.dtype)
         return f.unsqueeze(-1)
+
+    # ---------------- mean-field bookkeeping ----------------
+
+    @torch.no_grad()
+    def _compute_mA_on_dataset(self, X: torch.Tensor, sets: List[torch.Tensor]) -> List[List[float]]:
+        """
+        Compute m_A = (N^{1-γ}/B) * sum_i a_i * J_A(z_i) on the provided dataset X.
+        Here J_A(z_i) = (1/P) sum_μ φ(z_{iμ}) χ_A(x_μ). Works for single-output.
+        Returns list per experiment e: [m_A for A in sets].
+        """
+        if not sets:
+            return [[] for _ in range(self.E)]
+
+        Eexp, P, d = X.shape
+        invP = 1.0 / float(P)
+        s = self.scale_f  # N^{1-γ}/B
+        # Precompute χ_A(X) for every A
+        chi = []
+        for A in sets:
+            chi_A = parity_character(X, A)  # (E,P)
+            chi.append(chi_A)               # list len M
+        # Accumulator
+        mA_e = torch.zeros(self.E, len(sets), device=self.device, dtype=self.dtype)
+
+        step = self.algo.P_chunk_train or P
+        for start in range(0, P, step):
+            n = min(step, P - start)
+            Xc = X[:, start:start+n, :].contiguous()     # (E,n,d)
+            Z  = self._batched_mm_X_Wt(Xc, self.W.contiguous())  # (E,n,B)
+            Phi = activation(Z, self.mdl.act)                    # (E,n,B)
+            # For each A: J_A(z_i) chunk = (1/P) Φ_chunk^T χ_A_chunk
+            for jA, A in enumerate(sets):
+                chi_chunk = chi[jA][:, start:start+n]            # (E,n)
+                JA_chunk = torch.bmm(Phi.transpose(1,2), chi_chunk.unsqueeze(2)).squeeze(2) * invP  # (E,B)
+                # m_A increment = s * sum_i a_i * J_A(z_i)
+                mA_e[:, jA] += (JA_chunk * self.a[:, :, 0]).sum(dim=1) * s
+
+        return mA_e.detach().cpu().tolist()
+
+    @torch.no_grad()
+    def _outlier_diagnostics(self, X: torch.Tensor, topk: int = 4) -> Dict[str, Any]:
+        """Quick-and-dirty outlier diagnostics: pick top-|a| particles and compute
+        rescaled α_i = a_i / sqrt(N), Ĵ_{A,i} = J_A(z_i)/sqrt(N).
+        Returns per-experiment lists.
+        """
+        out = {"alpha": [], "Jhat": []}
+        if topk <= 0 or self.mdl.N <= 0 or not self.sets:
+            out["alpha"] = [[] for _ in range(self.E)]
+            out["Jhat"]  = [[[] for _ in range(self.E)]]
+            return out
+
+        Eexp = self.E
+        # select indices
+        a_abs = self.a[:, :, 0].abs()  # (E,B)
+        top_indices = torch.topk(a_abs, k=min(topk, self.mdl.B), dim=1).indices  # (E,topk)
+
+        # precompute J_A for selected particles only (efficiently by masking)
+        # We'll compute over the *training set* self._X_train
+        if self._X_train is None:
+            return {"alpha": [[] for _ in range(self.E)], "Jhat": [[] for _ in range(self.E)]}
+
+        X = self._X_train  # (E,P,d)
+        Eexp, P, d = X.shape
+        invP = 1.0 / float(P)
+        sqrtN = math.sqrt(self.mdl.N)
+        # Precompute χ_A(X)
+        chi = [parity_character(X, A) for A in self.sets]  # list M, tensors (E,P)
+
+        alpha_list = []
+        Jhat_list = []
+        step = self.algo.P_chunk_train or P
+        for e in range(Eexp):
+            idx = top_indices[e]  # (topk,)
+            alpha_e = (self.a[e, idx, 0] / sqrtN).detach().cpu().tolist()
+            # compute J_A(z_i)/sqrt(N) for each selected i
+            Jhat_e = []
+            for i_rel, i in enumerate(idx.tolist()):
+                # Accumulate J_A for particle i across chunks
+                JA_i = torch.zeros(len(self.sets), device=self.device, dtype=self.dtype)
+                for start in range(0, P, step):
+                    n = min(step, P - start)
+                    Xc = X[e:e+1, start:start+n, :].contiguous()               # (1,n,d)
+                    W_slice = self.W[e:e+1, i:i+1, :]                          # (1,1,d)  <-- keep batch dim
+                    Zi = torch.bmm(Xc, W_slice.transpose(-1, -2)).squeeze(-1)  # (1,n)
+                    Phii = activation(Zi, self.mdl.act).squeeze(0)             # (n,)
+
+                    for jA, chiA in enumerate(chi):
+                        JA_i[jA] += (Phii * chiA[e, start:start+n]).sum() * invP
+                Jhat_e.append((JA_i / sqrtN).detach().cpu().tolist())
+            alpha_list.append(alpha_e)
+            Jhat_list.append(Jhat_e)
+
+        out["alpha"] = alpha_list
+        out["Jhat"] = Jhat_list
+        return out
 
     # ---------------- SGLD ----------------
 
     @torch.no_grad()
     def _sgld_inner(self, X: torch.Tensor, r: torch.Tensor, eta: float, return_field: bool = False):
-        """One inner SGLD step. Optionally piggybacks the field on the last step.
-
-        Args:
-            X, r: training inputs and residual.
-            eta: step size.
-            return_field: if True, also compute and return f(X) for current params.
-        Returns:
-            f_acc: (E,P,1) field if return_field is True, else None.
-        """
         gw, ga, f_acc = self._stats_and_grads_stream(X, r, self.W, self.a, return_field=return_field)
         self.W.add_(gw, alpha=-eta)
         self.a.add_(ga, alpha=-eta)
@@ -480,7 +566,6 @@ class RSCavityExplicitMulti:
 
     @torch.no_grad()
     def _eval_on_X(self, X_eval: torch.Tensor) -> Dict[str, Any]:
-        """Evaluate metrics on provided X_eval (shape E,P_eval,d)."""
         d = self.mdl.d
         Eexp, P_eval, _ = X_eval.shape
         M = len(self.sets)
@@ -558,42 +643,29 @@ class RSCavityExplicitMulti:
     @torch.no_grad()
     def _anderson_update(self, f_prev: torch.Tensor, f_new: torch.Tensor,
                          aa_hist: List[torch.Tensor], g_hist: List[torch.Tensor]) -> Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor]]:
-        """
-        Walker-Ni Anderson (type-I/II hybrid): use differences of residuals to build a tiny LS problem.
-        f_prev: current estimate (E,P,1); f_new = G(f_prev).
-        aa_hist: list of past residuals r_i = f_i_new - f_i (flattened).
-        g_hist: list of past g_i = f_i_new (flattened).
-        """
         if not self.algo.use_anderson or self.algo.aa_depth <= 0:
             return f_new, aa_hist, g_hist
 
-        # residual at k
         r_k = (f_new - f_prev).detach().reshape(-1)
         g_k = f_new.detach().reshape(-1)
 
-        # append
         aa_hist.append(r_k)
         g_hist.append(g_k)
         if len(aa_hist) <= 1:
-            # not enough history
             if len(aa_hist) > self.algo.aa_depth:
                 aa_hist.pop(0); g_hist.pop(0)
             return f_new, aa_hist, g_hist
 
         m = min(self.algo.aa_depth, len(aa_hist)-1)
-        # use last m+1 residuals
         R_cols = []
         G_cols = []
         for i in range(-m-1, -1):
             R_cols.append(aa_hist[i])
             G_cols.append(g_hist[i])
-        R = torch.stack(R_cols, dim=1)   # [n, m+1]
-        # differences
-        dR = R[:, 1:] - R[:, :-1]        # [n, m]
-        dG = torch.stack(G_cols, dim=1)[:, 1:] - torch.stack(G_cols, dim=1)[:, :-1]  # [n, m]
+        R = torch.stack(R_cols, dim=1)
+        dR = R[:, 1:] - R[:, :-1]
+        dG = torch.stack(G_cols, dim=1)[:, 1:] - torch.stack(G_cols, dim=1)[:, :-1]
 
-        # Solve (dR^T dR + λI) * alpha = dR^T r_k
-        # alpha shape [m]
         lam = self.algo.aa_reg
         Gram = dR.T @ dR
         rhs  = dR.T @ r_k
@@ -603,11 +675,9 @@ class RSCavityExplicitMulti:
         except RuntimeError:
             alpha = torch.zeros(rhs.shape, device=self.device, dtype=rhs.dtype)
 
-        # accelerated update: f_{k+1} = g_k - dG * alpha
         g_next = g_k - (dG @ alpha)
         f_next = g_next.reshape_as(f_new)
 
-        # trim history
         if len(aa_hist) > self.algo.aa_depth + 1:
             aa_hist.pop(0); g_hist.pop(0)
 
@@ -619,10 +689,10 @@ class RSCavityExplicitMulti:
     def run(self, X: torch.Tensor, y: torch.Tensor, out_dir: str, tag: str="", dev_tag: str=""):
         os.makedirs(out_dir, exist_ok=True)
         X = X.to(self.dtype); y = y.to(self.dtype)
+        self._X_train, self._y_train = X, y
         Eexp, P, _ = X.shape
         f_mean = torch.zeros(Eexp, P, 1, device=self.device, dtype=self.dtype)
 
-        # small-P heuristic flag (kept from original)
         self._smallP = (P <= 100)
 
         hist = {
@@ -638,54 +708,49 @@ class RSCavityExplicitMulti:
             "rho_delta_rel": [],
             "eta": [], "K": [],
             "test_mse_small": [],
+            # NEW: mean-field bookkeeping
+            "mA_train_per_exp": [],
+            "outlier_alpha": [],
+            "outlier_Jhat": [],
         }
         t0 = time.time()
 
         ts = time.strftime("%Y%m%d_%H%M%S")
         fname = (
-            f"rs_aw_ard_sgld_FAST_{tag or ts}_Ptr{P}_E{self.E}_Peval{self.algo.P_eval_full}_"
+            f"rs_aw_ard_sgld_MF_{tag or ts}_Ptr{P}_E{self.E}_Peval{self.algo.P_eval_full}_"
             f"kap{self.kappa:.3e}_T{self.T:.3e}_N{self.mdl.N}_B{self.mdl.B}_g{self.mdl.gamma}_"
             f"act{self.mdl.act}_{'f64' if self.algo.use_float64 else 'f32'}{('_'+dev_tag) if dev_tag else ''}.json"
         )
         save_path = os.path.join(out_dir, fname)
 
-        # Early-stop counters & ARD trackers
         best_counter = 0
         prev_rho = self.rho.detach().clone()
         eps = 1e-24
 
-        # Anderson state
         aa_hist: List[torch.Tensor] = []
         g_hist: List[torch.Tensor]  = []
 
-        # For reduced saving frequency
         def maybe_save(payload, force=False):
             if force or (self._log_event_count % self.algo.save_every_logs == 0):
                 with open(save_path, "w") as f:
                     json.dump(payload, f, indent=2)
 
         for it in range(1, self.algo.outer_steps+1):
-            # cavity residual
             r = (y - f_mean)
 
-            # Scheduled LR and inner steps
             eta = self._scheduled_eta(it, P)
             K = self._scheduled_K(it)
 
-            # K inner SGLD steps (piggyback field on the last one)
             f_last = None
             for kstep in range(K):
                 f_last = self._sgld_inner(X, r, eta, return_field=(kstep == K-1))
 
-            # f_new from piggyback; fallback to explicit forward if None
             f_new = f_last if f_last is not None else self._field_from_particles_stream(X)
 
-            # compute FP residual BEFORE blending
             diff = (f_new - f_mean)
             fp_residual_per_e = torch.sqrt(torch.mean(diff*diff, dim=(1,2)))
             fp_residual_mean = float(fp_residual_per_e.mean().item())
 
-            # ARD update and rho change metric
             if self.ard.use_ard and (it % self.ard.update_every == 0):
                 self._update_rho_ard()
                 drho = self.rho - prev_rho
@@ -696,7 +761,6 @@ class RSCavityExplicitMulti:
             else:
                 rho_delta_rel = 0.0
 
-            # Anderson acceleration (outer map)
             if self.algo.use_anderson and ((it % self.algo.aa_every) == 0):
                 f_next, aa_hist, g_hist = self._anderson_update(f_mean, f_new, aa_hist, g_hist)
                 f_mean = f_next
@@ -706,8 +770,7 @@ class RSCavityExplicitMulti:
             train_mse_per_e = ((y - f_mean)**2).mean(dim=(1,2))
             train_mse_mean = float(train_mse_per_e.mean().item())
 
-            # -------- independent test-MSE early stop (IMMEDIATE) --------
-            test_es_triggered = False
+            # --- Optional: test-MSE early stop (unchanged) ---
             test_mse_val = None
             if (
                 self.algo.early_stop_test_mse_enabled
@@ -722,6 +785,16 @@ class RSCavityExplicitMulti:
                     self._ensure_full_eval_set()
                     ev = self._eval_on_X(self._X_eval_full)
                     rhomin = float(self.rho.min().item()); rhomax = float(self.rho.max().item())
+
+                    # Mean-field bookkeeping at stop
+                    if self.mfopts.compute_mA:
+                        mA_train = self._compute_mA_on_dataset(self._X_train, self.sets)
+                    else:
+                        mA_train = [[] for _ in range(self.E)]
+                    if self.mfopts.outlier_topk > 0:
+                        outdiag = self._outlier_diagnostics(self._X_train, self.mfopts.outlier_topk)
+                    else:
+                        outdiag = {"alpha": [[] for _ in range(self.E)], "Jhat": [[] for _ in range(self.E)]}
 
                     hist["iter"].append(it)
                     hist["train_mse"].append(train_mse_mean)
@@ -747,6 +820,9 @@ class RSCavityExplicitMulti:
                     hist["rho_delta_rel"].append(rho_delta_rel)
                     hist["eta"].append(eta); hist["K"].append(K)
                     hist["test_mse_small"].append(test_mse_val)
+                    hist["mA_train_per_exp"].append(mA_train)
+                    hist["outlier_alpha"].append(outdiag["alpha"])
+                    hist["outlier_Jhat"].append(outdiag["Jhat"])
 
                     payload = {
                         "summary": {
@@ -764,7 +840,8 @@ class RSCavityExplicitMulti:
                                 "ema": self.ard.ema, "update_every": self.ard.update_every,
                                 "rho_min": self.ard.rho_min, "rho_max": self.ard.rho_max,
                                 "use_ard": self.ard.use_ard
-                            }
+                            },
+                            "mfopts": self.mfopts.__dict__,
                         }
                     }
                     with open(save_path, "w") as f:
@@ -787,6 +864,15 @@ class RSCavityExplicitMulti:
                     self._ensure_full_eval_set()
                     ev = self._eval_on_X(self._X_eval_full)
                     rhomin = float(self.rho.min().item()); rhomax = float(self.rho.max().item())
+
+                    if self.mfopts.compute_mA:
+                        mA_train = self._compute_mA_on_dataset(self._X_train, self.sets)
+                    else:
+                        mA_train = [[] for _ in range(self.E)]
+                    if self.mfopts.outlier_topk > 0:
+                        outdiag = self._outlier_diagnostics(self._X_train, self.mfopts.outlier_topk)
+                    else:
+                        outdiag = {"alpha": [[] for _ in range(self.E)], "Jhat": [[] for _ in range(self.E)]}
 
                     hist["iter"].append(it)
                     hist["train_mse"].append(train_mse_mean)
@@ -813,6 +899,9 @@ class RSCavityExplicitMulti:
                     hist["eta"].append(eta); hist["K"].append(K)
                     if test_mse_val is not None:
                         hist["test_mse_small"].append(test_mse_val)
+                    hist["mA_train_per_exp"].append(mA_train)
+                    hist["outlier_alpha"].append(outdiag["alpha"])
+                    hist["outlier_Jhat"].append(outdiag["Jhat"])
 
                     payload = {
                         "summary": {
@@ -830,10 +919,12 @@ class RSCavityExplicitMulti:
                                 "ema": self.ard.ema, "update_every": self.ard.update_every,
                                 "rho_min": self.ard.rho_min, "rho_max": self.ard.rho_max,
                                 "use_ard": self.ard.use_ard
-                            }
+                            },
+                            "mfopts": self.mfopts.__dict__,
                         }
                     }
-                    maybe_save(payload, force=True)
+                    with open(save_path, "w") as f:
+                        json.dump(payload, f, indent=2)
                     print(f"[early-stop] it={it} mean_train_mse={train_mse_mean:.6f} fp_residual={fp_residual_mean:.6e} rho_delta_rel={rho_delta_rel:.3e}.")
                     early_stopped = True
 
@@ -845,12 +936,24 @@ class RSCavityExplicitMulti:
                 ev = self._eval_on_X(self._X_eval_small)   # cheap eval
                 rhomin = float(self.rho.min().item()); rhomax = float(self.rho.max().item())
 
-                # also record small-set test MSE if labels available
+                # small-set test MSE if labels available
                 if (self._y_eval_small is not None):
                     f_eval_small = self._field_from_particles_stream(self._X_eval_small)
                     test_mse_small = float(((f_eval_small - self._y_eval_small.to(self.dtype))**2).mean().item())
                 else:
                     test_mse_small = float('nan')
+
+                # --- NEW: compute m_A on the training set (your fixed-point C1) ---
+                if self.mfopts.compute_mA:
+                    mA_train = self._compute_mA_on_dataset(self._X_train, self.sets)
+                else:
+                    mA_train = [[] for _ in range(self.E)]
+
+                # --- NEW: Outlier diagnostics (optional) ---
+                if self.mfopts.outlier_topk > 0:
+                    outdiag = self._outlier_diagnostics(self._X_train, self.mfopts.outlier_topk)
+                else:
+                    outdiag = {"alpha": [[] for _ in range(self.E)], "Jhat": [[] for _ in range(self.E)]}
 
                 hist["iter"].append(it)
                 hist["train_mse"].append(train_mse_mean)
@@ -876,6 +979,9 @@ class RSCavityExplicitMulti:
                 hist["rho_delta_rel"].append(rho_delta_rel)
                 hist["eta"].append(eta); hist["K"].append(K)
                 hist["test_mse_small"].append(test_mse_small)
+                hist["mA_train_per_exp"].append(mA_train)
+                hist["outlier_alpha"].append(outdiag["alpha"])
+                hist["outlier_Jhat"].append(outdiag["Jhat"])
 
                 payload = {
                     "summary": {
@@ -892,7 +998,8 @@ class RSCavityExplicitMulti:
                             "ema": self.ard.ema, "update_every": self.ard.update_every,
                             "rho_min": self.ard.rho_min, "rho_max": self.ard.rho_max,
                             "use_ard": self.ard.use_ard
-                        }
+                        },
+                        "mfopts": self.mfopts.__dict__,
                     }
                 }
                 self._log_event_count += 1
@@ -912,12 +1019,24 @@ class RSCavityExplicitMulti:
                     "rho_delta_rel": rho_delta_rel,
                     "eta": eta, "K": K,
                     "test_mse_small": test_mse_small,
+                    "mA_train_first_exp": mA_train[0] if len(mA_train)>0 else [],
                 }))
 
         # Final FULL EVAL if not early-stopped
         self._ensure_full_eval_set()
         ev = self._eval_on_X(self._X_eval_full)
         rhomin = float(self.rho.min().item()); rhomax = float(self.rho.max().item())
+
+        # Final mean-field bookkeeping
+        if self.mfopts.compute_mA:
+            mA_train = self._compute_mA_on_dataset(self._X_train, self.sets)
+        else:
+            mA_train = [[] for _ in range(self.E)]
+        if self.mfopts.outlier_topk > 0:
+            outdiag = self._outlier_diagnostics(self._X_train, self.mfopts.outlier_topk)
+        else:
+            outdiag = {"alpha": [[] for _ in range(self.E)], "Jhat": [[] for _ in range(self.E)]}
+
         hist["iter"].append(it)
         hist["train_mse"].append(float(((y - f_mean)**2).mean().item()))
         hist["train_mse_per_exp"].append(((y - f_mean)**2).mean(dim=(1,2)).detach().cpu().tolist())
@@ -942,6 +1061,9 @@ class RSCavityExplicitMulti:
         hist["rho_delta_rel"].append(0.0)
         hist["eta"].append(self._scheduled_eta(it, P))
         hist["K"].append(self._scheduled_K(it))
+        hist["mA_train_per_exp"].append(mA_train)
+        hist["outlier_alpha"].append(outdiag["alpha"])
+        hist["outlier_Jhat"].append(outdiag["Jhat"])
 
         payload = {
             "summary": {
@@ -958,7 +1080,8 @@ class RSCavityExplicitMulti:
                     "ema": self.ard.ema, "update_every": self.ard.update_every,
                     "rho_min": self.ard.rho_min, "rho_max": self.ard.rho_max,
                     "use_ard": self.ard.use_ard
-                }
+                },
+                "mfopts": self.mfopts.__dict__,
             }
         }
         with open(save_path, "w") as f:
@@ -1004,7 +1127,7 @@ def shard_experiments(exps: List[Dict[str, Any]], num_devices: int, strategy: st
 # ----------------------------- worker ------------------------------
 
 def worker_process(dev_id: int, shard: List[Dict[str, Any]], mdl_dict: Dict[str, Any], algo_dict: Dict[str, Any], ard_dict: Dict[str, Any],
-                   out_dir: str, teacher_sets_spec: str, use_float64: bool):
+                   out_dir: str, teacher_sets_spec: str, use_float64: bool, mfopts_dict: Dict[str, Any]):
     if torch.cuda.is_available():
         torch.cuda.set_device(dev_id)
         device = torch.device(f"cuda:{dev_id}")
@@ -1014,6 +1137,7 @@ def worker_process(dev_id: int, shard: List[Dict[str, Any]], mdl_dict: Dict[str,
     mdl = Model(**mdl_dict)
     algo = Algo(**algo_dict)
     ard = ARD(**ard_dict)
+    mfopts = MFOptions(**mfopts_dict)
 
     sets = [torch.tensor(s, device=device, dtype=torch.long) for s in parse_sets(teacher_sets_spec)]
 
@@ -1024,12 +1148,12 @@ def worker_process(dev_id: int, shard: List[Dict[str, Any]], mdl_dict: Dict[str,
         dtype = torch.float64 if use_float64 else torch.float32
         X, y = generate_parity_multi(P, mdl.d, sets, E, data_seeds, device, dtype)
 
-        solver = RSCavityExplicitMulti(mdl, algo, kappa, device, E=E, seeds_params=param_seeds, teacher_sets=sets, ard=ard)
+        solver = RSCavityExplicitMulti(mdl, algo, kappa, device, E=E, seeds_params=param_seeds, teacher_sets=sets, ard=ard, mfopts=mfopts)
         tag = f"P{P}_kap{kappa:.3e}"
         dev_tag = f"dev{dev_id}"
-        print(f"\n===== RUN start: P={P}, kappa={kappa:.6g}, T={solver.T:.6g}, E={E}, device={device}, dtype={'float64' if algo.use_float64 else 'float32'} =====")
+        print(f"\\n===== RUN start: P={P}, kappa={kappa:.6g}, T={solver.T:.6g}, E={E}, device={device}, dtype={'float64' if algo.use_float64 else 'float32'} =====")
         result = solver.run(X, y, out_dir, tag=tag, dev_tag=dev_tag)
-        print(f"===== RUN done: saved -> {result['path']} =====\n")
+        print(f"===== RUN done: saved -> {result['path']} =====\\n")
 
         del solver, X, y
         if torch.cuda.is_available():
@@ -1040,22 +1164,26 @@ def worker_process(dev_id: int, shard: List[Dict[str, Any]], mdl_dict: Dict[str,
 if __name__ == "__main__":
     set_seed(42)
 
+    # Example: single parity teacher {0,1,2,3}
     teacher_sets_spec = "{0,1,2,3}"
     d = 35
 
-    P_train_list =[500,1000,10000,2133 ,10, 100, 750, 3666, 5000, 7500]
-    kappa_list   =  [1e-1]  #5e-3,7-5e-3,5e-4,1e-3,1e-2,5e-2
+    # Grid
+    P_train_list = [500, 1000, 10000, 2133, 10, 100, 750, 3666, 5000, 7500]
+    kappa_list   = [5e-3]
     num_exp = 3
     base_seed = 123456
 
     use_float64 = False
-    mdl = Model(d=d, B=512, N=512, gamma=0.5, sigma_a=1.0, sigma_w=1.0, act="relu")
+
+    # IMPORTANT for VMS non-lazy: set gamma=1.0
+    mdl = Model(d=d, B=512, N=512, gamma=1.0, sigma_a=1.0, sigma_w=1.0, act="relu")
     algo = Algo(
-        outer_steps=7_500_000,
+        outer_steps=1_000_000,
         step_size=1e-2,
-        log_every=50_000,            # less frequent logs
+        log_every=50_000,
         batch_eval=131_072,
-        P_chunk_train=131_072*2,     # big chunks for better GPU utilization
+        P_chunk_train=262_144,
 
         use_float64=use_float64,
         grad_clip_norm=None,
@@ -1063,7 +1191,6 @@ if __name__ == "__main__":
         nan_reinit_std_scale=1.0,
         log_bad_counts=True,
 
-        # --- Composite early stop (unchanged) ---
         early_stop_enabled=True,
         early_stop_use_mse=True,
         early_stop_threshold=0.005,
@@ -1073,40 +1200,39 @@ if __name__ == "__main__":
         early_stop_use_rho=True,
         early_stop_rho_epsilon=1e-3,
 
-        # --- Independent TEST MSE early stop (new) ---
         early_stop_test_mse_enabled=True,
         early_stop_test_mse_threshold=0.01,
         test_mse_check_every=5000,
         test_mse_use_small_eval=True,
 
-        # --- LR decay (power 2) ---
         use_lr_decay=True,
-        lr_start=1e-3,     # you can set to 1e-3 to mirror Code 2 exactly
-        lr_end=5e-4,       # set to 5e-4 to mirror Code 2 exactly
-        lr_decay_iters=2_000_000,  # set to 2_000_000 to mirror Code 2 exactly
+        lr_start=1e-3,
+        lr_end=5e-4,
+        lr_decay_iters=2_000_000,
 
-        # --- Inner SGLD steps schedule ---
         K0=12,
         Kmin=2,
         K_decay=600_000,
 
-        # --- Anderson acceleration ---
         use_anderson=False,
         aa_depth=3,
         aa_reg=1e-8,
         aa_every=1,
 
-        # --- Eval/log slimming ---
-        P_eval_full=100_000,    # full eval only at ES/final
-        P_eval_routine=32_768,  # cheap routine eval
-        save_every_logs=2,      # write json every 3rd log event
+        P_eval_full=100_000,
+        P_eval_routine=32_768,
+        save_every_logs=2,
     )
+
     alpha0 = 4.0
     beta01 = alpha0 / d
     ard = ARD(use_ard=False, alpha0=alpha0, ema=0.5, update_every=1,
               rho_min=0.0, rho_max=1e18, beta0=beta01)
 
-    out_dir = "/home/goring/mean_field_langevin/MCMC_composite/results_d35k4hm_paper_final_ard=no_fin2/1e-1_2"
+    # Mean-field bookkeeping options
+    mfopts = MFOptions(compute_mA=True, outlier_topk=4)
+
+    out_dir = "/home/goring/mean_field_langevin/results_vms/test"
     shard_strategy = "round_robin"
 
     os.makedirs(out_dir, exist_ok=True)
@@ -1122,10 +1248,10 @@ if __name__ == "__main__":
                 target=worker_process,
                 args=(dev_id, shards[dev_id],
                       mdl.__dict__, algo.__dict__, ard.__dict__,
-                      out_dir, teacher_sets_spec, algo.use_float64),
+                      out_dir, teacher_sets_spec, algo.use_float64, mfopts.__dict__),
             )
             p.start(); procs.append(p)
         for p in procs:
             p.join()
     else:
-        worker_process(0, shards[0], mdl.__dict__, algo.__dict__, ard.__dict__, out_dir, teacher_sets_spec, algo.use_float64)
+        worker_process(0, shards[0], mdl.__dict__, algo.__dict__, ard.__dict__, out_dir, teacher_sets_spec, algo.use_float64, mfopts.__dict__)

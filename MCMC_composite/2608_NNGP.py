@@ -529,7 +529,7 @@ if __name__ == "__main__":
     M_components = len(teacher_sets)
 
     # Eval set (fixed across runs)
-    P_eval = 50000
+    P_eval = 200000
     X_eval, y_eval, _ = generate_composite_data(P_eval, d, teacher_sets, device)
 
     # ---- GP / CG knobs ----
@@ -546,10 +546,10 @@ if __name__ == "__main__":
     )
 
     # ---- Sweep lists (edit here) ----
-    P_TRAIN_LIST = [500,1000,10000,2133 ,10, 100, 750, 3666, 5000, 7500]     # training sizes
+    P_TRAIN_LIST = [500,1000,10000,2133 ,10, 100, 750, 3666, 5000, 7500,20000,30000,50000] #[500,1000,10000,2133 ,10, 100, 750, 3666, 5000, 7500]     # training sizes
     KAPPA_LIST   = [5e-3]             # noise levels
 
-    results_dir = "/home/goring/mean_field_langevin/MCMC_composite/results_NNGP/d35_k4_5e-3_paper"
+    results_dir = "/home/goring/mean_field_langevin/MCMC_composite/results_reb/NNGPd35k4_long4"
     os.makedirs(results_dir, exist_ok=True)
 
     # ---- Run sweep ----

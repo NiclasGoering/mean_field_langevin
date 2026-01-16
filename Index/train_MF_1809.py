@@ -27,44 +27,63 @@ def act_prime(z: torch.Tensor, kind: str) -> torch.Tensor:
     if kind == "tanh": return 1.0 - torch.tanh(z) ** 2
     raise ValueError(f"Unknown activation: {kind}")
 
-def parity_character(X_pm1: torch.Tensor, S: torch.Tensor) -> torch.Tensor:
-    if X_pm1.dim() == 2:
-        if S.numel() == 0:
-            return torch.ones(X_pm1.shape[0], device=X_pm1.device, dtype=X_pm1.dtype)
-        return X_pm1[:, S].prod(dim=1).to(X_pm1.dtype)
-    elif X_pm1.dim() == 3:
-        if S.numel() == 0:
-            return torch.ones(X_pm1.shape[0], X_pm1.shape[1], device=X_pm1.device, dtype=X_pm1.dtype)
-        return X_pm1[:, :, S].prod(dim=2).to(X_pm1.dtype)
-    else:
-        raise ValueError("X must be (P,d) or (E,P,d)")
+# -------- single-index Hermite teacher (from code 2), but batched for E exps --------
 
-def parse_sets(spec: str) -> List[List[int]]:
-    import re
-    blocks = re.findall(r"\{([^}]*)\}", spec)
-    out = []
-    for s in blocks:
-        toks = [t.strip() for t in s.split(",") if t.strip()!=""]
-        out.append(sorted(map(int, toks)))
-    if not out: raise ValueError("bad teacher spec")
-    return out
+def _hermite_he(z: torch.Tensor, n: int) -> torch.Tensor:
+    """Probabilists' Hermite polynomials He_n(z): He_0=1, He_1=z, He_{n+1}=z*He_n - n*He_{n-1}."""
+    if n < 0:
+        raise ValueError("Hermite degree n must be >= 0")
+    if n == 0:
+        return torch.ones_like(z)
+    if n == 1:
+        return z
+    He_nm1 = torch.ones_like(z)   # He_0
+    He_n_  = z                    # He_1
+    for k in range(1, n):
+        He_np1 = z * He_n_ - k * He_nm1
+        He_nm1, He_n_ = He_n_, He_np1
+    return He_n_
 
-def generate_parity_multi(P: int, d: int, sets: List[torch.Tensor], E: int,
-                          data_seeds: List[int], device, dtype) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Generate E independent parity datasets in ±1 coding.
-    Returns X ∈ ℝ[E,P,d], y ∈ ℝ[E,P,1]."""
+def generate_single_index_hermite_multi(
+    P: int, d: int, k: int, E: int,
+    data_seeds: List[int], device, dtype,
+    hermite_degree: int = 5, random_support: bool = True
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Generate E independent datasets for a single-index model:
+      X ~ N(0, I_d), choose support S of size k (random per exp by default),
+      w_i = 1/sqrt(k) on S else 0, z = X @ w, y = sign(He_p(z)) in {-1,+1}.
+    Returns:
+      X ∈ ℝ[E,P,d], y ∈ ℝ[E,P,1], W ∈ ℝ[E,d] (teacher vectors per experiment).
+    """
     assert len(data_seeds) == E
-    Xs, ys = [], []
+    Xs, ys, Ws = [], [], []
     for e in range(E):
         g = torch.Generator(device=device).manual_seed(int(data_seeds[e]))
-        Xe = (torch.randint(0,2,(P,d),generator=g,device=device,dtype=torch.int8).to(dtype) * 2.0 - 1.0)
-        Ccols = [parity_character(Xe, S) for S in sets]
-        Ce = torch.stack(Ccols, dim=1) if Ccols else torch.zeros(P,0,device=device, dtype=dtype)
-        ye = Ce.sum(dim=1, keepdim=True)
-        Xs.append(Xe); ys.append(ye)
-    X = torch.stack(Xs, dim=0)
-    y = torch.stack(ys, dim=0)
-    return X, y
+        # support
+        if k > d:
+            raise ValueError("k cannot exceed d")
+        if k > 0:
+            if random_support:
+                idx = torch.randperm(d, generator=g, device=device)[:k]
+            else:
+                idx = torch.arange(k, device=device)
+        # teacher vector
+        we = torch.zeros(d, device=device, dtype=dtype)
+        if k > 0:
+            we[idx] = 1.0 / math.sqrt(k)
+
+        Xe = torch.randn(P, d, generator=g, device=device, dtype=dtype)
+        ze = Xe @ we
+        gz = _hermite_he(ze, hermite_degree)
+        ye = torch.where(gz >= 0, torch.tensor(1.0, device=device, dtype=dtype),
+                         torch.tensor(-1.0, device=device, dtype=dtype)).unsqueeze(1)
+
+        Xs.append(Xe); ys.append(ye); Ws.append(we)
+    X = torch.stack(Xs, dim=0)            # (E,P,d)
+    y = torch.stack(ys, dim=0)            # (E,P,1)
+    W = torch.stack(Ws, dim=0)            # (E,d)
+    return X, y, W
 
 # ----------------------------- config -----------------------------
 
@@ -156,15 +175,22 @@ class Algo:
 class RSCavityExplicitMulti:
     def __init__(self, mdl: Model, algo: Algo, kappa: float, device: torch.device,
                  E: int, seeds_params: List[int],
-                 teacher_sets: Optional[List[torch.Tensor]] = None,
-                 ard: Optional[ARD] = None):
+                 ard: Optional[ARD] = None,
+                 # NEW: teacher info
+                 teacher_ws: Optional[torch.Tensor] = None,
+                 hermite_degree: int = 5,
+                 k_support: int = 0):
         self.mdl, self.algo, self.kappa = mdl, algo, float(kappa)
         self.device = device
-        self.sets = teacher_sets or []
         self.ard = ard or ARD()
         self.dtype = torch.float64 if algo.use_float64 else torch.float32
         self.E = int(E)
         assert len(seeds_params) == E
+
+        # Keep teacher (for eval label generation)
+        self.teacher_ws = teacher_ws  # (E,d) or None
+        self.hermite_degree = int(hermite_degree)
+        self.k_support = int(k_support)
 
         # Temperature to match "code 2"
         self.T = 2.0 * (self.kappa ** 2)
@@ -236,20 +262,21 @@ class RSCavityExplicitMulti:
     # ---------- helpers ----------
 
     def _make_eval_sets(self):
-        """Pre-generate and cache routine (small) eval X (and y if teacher sets available).
-        Defer full eval X until needed."""
+        """Pre-generate and cache routine (small) eval X and y based on the Hermite teacher."""
         d = self.mdl.d
         P_small = self.algo.P_eval_routine
         g_base = 987654321
         Xs = []; Ys = []
         for e in range(self.E):
             g = torch.Generator(device=self.device).manual_seed(g_base + e)
-            Xe = (torch.randint(0,2,(P_small,d),generator=g,device=self.device,dtype=torch.int8).to(self.dtype) * 2.0 - 1.0)
+            Xe = torch.randn(P_small, d, generator=g, device=self.device, dtype=self.dtype)
             Xs.append(Xe)
-            if len(self.sets) > 0:
-                Ccols = [parity_character(Xe, S) for S in self.sets]
-                Ce = torch.stack(Ccols, dim=1) if Ccols else torch.zeros(P_small,0,device=self.device, dtype=self.dtype)
-                Ye = Ce.sum(dim=1, keepdim=True)
+            if self.teacher_ws is not None:
+                we = self.teacher_ws[e].to(self.dtype)
+                ze = Xe @ we
+                gz = _hermite_he(ze, self.hermite_degree)
+                Ye = torch.where(gz >= 0, torch.tensor(1.0, device=self.device, dtype=self.dtype),
+                                 torch.tensor(-1.0, device=self.device, dtype=self.dtype)).unsqueeze(1)
                 Ys.append(Ye)
         self._X_eval_small = torch.stack(Xs, dim=0)
         self._y_eval_small = torch.stack(Ys, dim=0) if Ys else None
@@ -263,12 +290,14 @@ class RSCavityExplicitMulti:
         Xs = []; Ys = []
         for e in range(self.E):
             g = torch.Generator(device=self.device).manual_seed(g_base + e)
-            Xe = (torch.randint(0,2,(P_full,d),generator=g,device=self.device,dtype=torch.int8).to(self.dtype) * 2.0 - 1.0)
+            Xe = torch.randn(P_full, d, generator=g, device=self.device, dtype=self.dtype)
             Xs.append(Xe)
-            if len(self.sets) > 0:
-                Ccols = [parity_character(Xe, S) for S in self.sets]
-                Ce = torch.stack(Ccols, dim=1) if Ccols else torch.zeros(P_full,0,device=self.device, dtype=self.dtype)
-                Ye = Ce.sum(dim=1, keepdim=True)
+            if self.teacher_ws is not None:
+                we = self.teacher_ws[e].to(self.dtype)
+                ze = Xe @ we
+                gz = _hermite_he(ze, self.hermite_degree)
+                Ye = torch.where(gz >= 0, torch.tensor(1.0, device=self.device, dtype=self.dtype),
+                                 torch.tensor(-1.0, device=self.device, dtype=self.dtype)).unsqueeze(1)
                 Ys.append(Ye)
         self._X_eval_full = torch.stack(Xs, dim=0)
         self._y_eval_full = torch.stack(Ys, dim=0) if Ys else None
@@ -440,15 +469,7 @@ class RSCavityExplicitMulti:
 
     @torch.no_grad()
     def _sgld_inner(self, X: torch.Tensor, r: torch.Tensor, eta: float, return_field: bool = False):
-        """One inner SGLD step. Optionally piggybacks the field on the last step.
-
-        Args:
-            X, r: training inputs and residual.
-            eta: step size.
-            return_field: if True, also compute and return f(X) for current params.
-        Returns:
-            f_acc: (E,P,1) field if return_field is True, else None.
-        """
+        """One inner SGLD step. Optionally piggybacks the field on the last step."""
         gw, ga, f_acc = self._stats_and_grads_stream(X, r, self.W, self.a, return_field=return_field)
         self.W.add_(gw, alpha=-eta)
         self.a.add_(ga, alpha=-eta)
@@ -483,10 +504,8 @@ class RSCavityExplicitMulti:
         """Evaluate metrics on provided X_eval (shape E,P_eval,d)."""
         d = self.mdl.d
         Eexp, P_eval, _ = X_eval.shape
-        M = len(self.sets)
+        # Keep legacy structure: compute f^2/2 averages; teacher-decomp fields are placeholders when no analytic teacher matrix is used.
         f2_sum = torch.zeros(Eexp, device=self.device, dtype=self.dtype)
-        v_list = torch.zeros(Eexp, M, device=self.device, dtype=self.dtype) if M>0 else None
-        G_list = torch.zeros(Eexp, M, M, device=self.device, dtype=self.dtype) if M>0 else None
 
         scale = self.scale_f
         a = self.a.detach()
@@ -500,57 +519,21 @@ class RSCavityExplicitMulti:
             f = (scale * torch.bmm(Phi, a).squeeze(-1))
             f2_sum += (f*f).sum(dim=1)
 
-            if M>0:
-                for e in range(Eexp):
-                    Ccols = [parity_character(Xc[e], S) for S in self.sets]
-                    C = torch.stack(Ccols, dim=1)
-                    v_list[e] += C.t().matmul(f[e])
-                    G_list[e] += C.t().matmul(C)
-
         invP_eval = 1.0/float(P_eval)
         f2_bar = f2_sum * invP_eval
+        mean_val = float((0.5*f2_bar).mean().item())
         out = {
             'half_mse_empirical_per_exp': (0.5*f2_bar).tolist(),
             'half_mse_total_ms_per_exp': (0.5*f2_bar).tolist(),
             'half_mse_modes_per_exp': [0.0]*Eexp,
             'half_noise_per_exp': (0.5*f2_bar).tolist(),
+            'half_mse_empirical': mean_val,
+            'half_mse_total_ms': mean_val,
+            'half_mse_modes': 0.0,
+            'half_noise': mean_val,
+            'm_S_per_exp': [[] for _ in range(Eexp)],
+            'm_S': [],
         }
-        if M==0:
-            mean_val = float((0.5*f2_bar).mean().item())
-            out.update(
-                half_mse_empirical=mean_val, half_mse_total_ms=mean_val,
-                half_mse_modes=0.0, half_noise=mean_val,
-                m_S_per_exp=[[] for _ in range(Eexp)], m_S=[]
-            ); return out
-
-        half_modes = []; half_noise = []; half_total = []; half_emp = []; m_S_per_exp = []
-        ones = torch.ones(M, device=self.device, dtype=self.dtype)
-        for e in range(Eexp):
-            v = v_list[e] * invP_eval; G = G_list[e] * invP_eval
-            m_S = v; m_S_per_exp.append(m_S.detach().cpu().tolist())
-            mTm = float((m_S*m_S).sum().item())
-            mTGm = float(m_S.view(1,-1).matmul(G).matmul(m_S.view(-1,1)).item())
-            noise = float(f2_bar[e].item()) - 2.0*mTm + mTGm
-            half_modes.append(0.5*float(((1.0-m_S)**2).sum().item()))
-            half_noise.append(0.5*float(noise))
-            half_total.append(half_modes[-1] + half_noise[-1])
-            half_emp.append(0.5*(float(f2_bar[e].item()) - 2.0*float(ones.dot(v).item())
-                                 + float(ones.view(1,-1).matmul(G).matmul(ones.view(-1,1)).item())))
-
-        m_arr = np.array(m_S_per_exp, dtype=float) if m_S_per_exp else np.zeros((Eexp,0))
-        m_mean = m_arr.mean(axis=0).tolist() if m_arr.size>0 else []
-        out.update(
-            half_mse_modes_per_exp=half_modes,
-            half_noise_per_exp=half_noise,
-            half_mse_total_ms_per_exp=half_total,
-            half_mse_empirical_per_exp=half_emp,
-            half_mse_modes=float(np.mean(half_modes)),
-            half_noise=float(np.mean(half_noise)),
-            half_mse_total_ms=float(np.mean(half_total)),
-            half_mse_empirical=float(np.mean(half_emp)),
-            m_S_per_exp=m_S_per_exp,
-            m_S=m_mean,
-        )
         return out
 
     # ---------------- Anderson acceleration ----------------
@@ -558,42 +541,30 @@ class RSCavityExplicitMulti:
     @torch.no_grad()
     def _anderson_update(self, f_prev: torch.Tensor, f_new: torch.Tensor,
                          aa_hist: List[torch.Tensor], g_hist: List[torch.Tensor]) -> Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor]]:
-        """
-        Walker-Ni Anderson (type-I/II hybrid): use differences of residuals to build a tiny LS problem.
-        f_prev: current estimate (E,P,1); f_new = G(f_prev).
-        aa_hist: list of past residuals r_i = f_i_new - f_i (flattened).
-        g_hist: list of past g_i = f_i_new (flattened).
-        """
+        """Walker-Ni Anderson acceleration."""
         if not self.algo.use_anderson or self.algo.aa_depth <= 0:
             return f_new, aa_hist, g_hist
 
-        # residual at k
         r_k = (f_new - f_prev).detach().reshape(-1)
         g_k = f_new.detach().reshape(-1)
 
-        # append
         aa_hist.append(r_k)
         g_hist.append(g_k)
         if len(aa_hist) <= 1:
-            # not enough history
             if len(aa_hist) > self.algo.aa_depth:
                 aa_hist.pop(0); g_hist.pop(0)
             return f_new, aa_hist, g_hist
 
         m = min(self.algo.aa_depth, len(aa_hist)-1)
-        # use last m+1 residuals
         R_cols = []
         G_cols = []
         for i in range(-m-1, -1):
             R_cols.append(aa_hist[i])
             G_cols.append(g_hist[i])
-        R = torch.stack(R_cols, dim=1)   # [n, m+1]
-        # differences
-        dR = R[:, 1:] - R[:, :-1]        # [n, m]
-        dG = torch.stack(G_cols, dim=1)[:, 1:] - torch.stack(G_cols, dim=1)[:, :-1]  # [n, m]
+        R = torch.stack(R_cols, dim=1)
+        dR = R[:, 1:] - R[:, :-1]
+        dG = torch.stack(G_cols, dim=1)[:, 1:] - torch.stack(G_cols, dim=1)[:, :-1]
 
-        # Solve (dR^T dR + λI) * alpha = dR^T r_k
-        # alpha shape [m]
         lam = self.algo.aa_reg
         Gram = dR.T @ dR
         rhs  = dR.T @ r_k
@@ -603,11 +574,9 @@ class RSCavityExplicitMulti:
         except RuntimeError:
             alpha = torch.zeros(rhs.shape, device=self.device, dtype=rhs.dtype)
 
-        # accelerated update: f_{k+1} = g_k - dG * alpha
         g_next = g_k - (dG @ alpha)
         f_next = g_next.reshape_as(f_new)
 
-        # trim history
         if len(aa_hist) > self.algo.aa_depth + 1:
             aa_hist.pop(0); g_hist.pop(0)
 
@@ -711,7 +680,6 @@ class RSCavityExplicitMulti:
             test_mse_val = None
             if (
                 self.algo.early_stop_test_mse_enabled
-                and (len(self.sets) > 0)
                 and (self._X_eval_small is not None)
                 and (self._y_eval_small is not None)
                 and (it % max(1, self.algo.test_mse_check_every) == 0)
@@ -764,6 +732,12 @@ class RSCavityExplicitMulti:
                                 "ema": self.ard.ema, "update_every": self.ard.update_every,
                                 "rho_min": self.ard.rho_min, "rho_max": self.ard.rho_max,
                                 "use_ard": self.ard.use_ard
+                            },
+                            "teacher": {
+                                "type": "single_index_hermite",
+                                "k_support": self.k_support,
+                                "hermite_degree": self.hermite_degree,
+                                "support_selection": "random_per_experiment"
                             }
                         }
                     }
@@ -830,6 +804,12 @@ class RSCavityExplicitMulti:
                                 "ema": self.ard.ema, "update_every": self.ard.update_every,
                                 "rho_min": self.ard.rho_min, "rho_max": self.ard.rho_max,
                                 "use_ard": self.ard.use_ard
+                            },
+                            "teacher": {
+                                "type": "single_index_hermite",
+                                "k_support": self.k_support,
+                                "hermite_degree": self.hermite_degree,
+                                "support_selection": "random_per_experiment"
                             }
                         }
                     }
@@ -892,6 +872,12 @@ class RSCavityExplicitMulti:
                             "ema": self.ard.ema, "update_every": self.ard.update_every,
                             "rho_min": self.ard.rho_min, "rho_max": self.ard.rho_max,
                             "use_ard": self.ard.use_ard
+                        },
+                        "teacher": {
+                            "type": "single_index_hermite",
+                            "k_support": self.k_support,
+                            "hermite_degree": self.hermite_degree,
+                            "support_selection": "random_per_experiment"
                         }
                     }
                 }
@@ -951,13 +937,24 @@ class RSCavityExplicitMulti:
             },
             "traj": hist,
             "config": {
-                "model": self.mdl.__dict__, "algo": self.algo.__dict__,
-                "kappa": self.kappa, "T": self.T,
+                "model": self.mdl.__dict__,
+                "algo": self.algo.__dict__,
+                "kappa": self.kappa,
+                "T": self.T,
                 "ard": {
-                    "alpha0": self.ard.alpha0, "beta0": self.beta0,
-                    "ema": self.ard.ema, "update_every": self.ard.update_every,
-                    "rho_min": self.ard.rho_min, "rho_max": self.ard.rho_max,
+                    "alpha0": self.ard.alpha0,
+                    "beta0": self.beta0,
+                    "ema": self.ard.ema,
+                    "update_every": self.ard.update_every,
+                    "rho_min": self.ard.rho_min,
+                    "rho_max": self.ard.rho_max,
                     "use_ard": self.ard.use_ard
+                },
+                "teacher": {
+                    "type": "single_index_hermite",
+                    "k_support": self.k_support,
+                    "hermite_degree": self.hermite_degree,
+                    "support_selection": "random_per_experiment"
                 }
             }
         }
@@ -1004,7 +1001,7 @@ def shard_experiments(exps: List[Dict[str, Any]], num_devices: int, strategy: st
 # ----------------------------- worker ------------------------------
 
 def worker_process(dev_id: int, shard: List[Dict[str, Any]], mdl_dict: Dict[str, Any], algo_dict: Dict[str, Any], ard_dict: Dict[str, Any],
-                   out_dir: str, teacher_sets_spec: str, use_float64: bool):
+                   out_dir: str, hermite_degree: int, k_support: int):
     if torch.cuda.is_available():
         torch.cuda.set_device(dev_id)
         device = torch.device(f"cuda:{dev_id}")
@@ -1015,23 +1012,28 @@ def worker_process(dev_id: int, shard: List[Dict[str, Any]], mdl_dict: Dict[str,
     algo = Algo(**algo_dict)
     ard = ARD(**ard_dict)
 
-    sets = [torch.tensor(s, device=device, dtype=torch.long) for s in parse_sets(teacher_sets_spec)]
-
     for econf in shard:
         P = econf['P']; kappa = econf['kappa']; E = econf['E']
         data_seeds = econf['data_seeds']; param_seeds = econf['param_seeds']
 
-        dtype = torch.float64 if use_float64 else torch.float32
-        X, y = generate_parity_multi(P, mdl.d, sets, E, data_seeds, device, dtype)
+        dtype = torch.float64 if algo.use_float64 else torch.float32
 
-        solver = RSCavityExplicitMulti(mdl, algo, kappa, device, E=E, seeds_params=param_seeds, teacher_sets=sets, ard=ard)
+        # --- NEW: single-index Hermite data ---
+        X, y, W_teacher = generate_single_index_hermite_multi(
+            P, mdl.d, k_support, E, data_seeds, device, dtype, hermite_degree=hermite_degree, random_support=True
+        )
+
+        solver = RSCavityExplicitMulti(
+            mdl, algo, kappa, device, E=E, seeds_params=param_seeds, ard=ard,
+            teacher_ws=W_teacher, hermite_degree=hermite_degree, k_support=k_support
+        )
         tag = f"P{P}_kap{kappa:.3e}"
         dev_tag = f"dev{dev_id}"
         print(f"\n===== RUN start: P={P}, kappa={kappa:.6g}, T={solver.T:.6g}, E={E}, device={device}, dtype={'float64' if algo.use_float64 else 'float32'} =====")
         result = solver.run(X, y, out_dir, tag=tag, dev_tag=dev_tag)
         print(f"===== RUN done: saved -> {result['path']} =====\n")
 
-        del solver, X, y
+        del solver, X, y, W_teacher
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -1040,16 +1042,19 @@ def worker_process(dev_id: int, shard: List[Dict[str, Any]], mdl_dict: Dict[str,
 if __name__ == "__main__":
     set_seed(42)
 
-    teacher_sets_spec = "{0,1,2,3}"
-    d = 35
+    # --- Teacher settings (single-index Hermite) ---
+    hermite_degree = 3   # degree p
+    k_support = 3        # number of active coords in the teacher vector
 
-    P_train_list =[500,1000,10000,2133 ,10, 100, 750, 3666, 5000, 7500]
-    kappa_list   =  [1e-1]  #5e-3,7-5e-3,5e-4,1e-3,1e-2,5e-2
-    num_exp = 3
+    d = 22
+
+    P_train_list =  [10,100,500,1000,5000,10000]#[100,500,1000,5000]#[500, 1000, 10000, 2133, 10, 100, 750, 3666, 5000, 7500]
+    kappa_list   = [5e-4]
+    num_exp = 1
     base_seed = 123456
 
     use_float64 = False
-    mdl = Model(d=d, B=512, N=512, gamma=0.5, sigma_a=1.0, sigma_w=1.0, act="relu")
+    mdl = Model(d=d, B=512, N=512, gamma=0.5, sigma_a=1.0, sigma_w=1.0, act="tanh")
     algo = Algo(
         outer_steps=7_500_000,
         step_size=1e-2,
@@ -1081,9 +1086,9 @@ if __name__ == "__main__":
 
         # --- LR decay (power 2) ---
         use_lr_decay=True,
-        lr_start=1e-3,     # you can set to 1e-3 to mirror Code 2 exactly
-        lr_end=5e-4,       # set to 5e-4 to mirror Code 2 exactly
-        lr_decay_iters=2_000_000,  # set to 2_000_000 to mirror Code 2 exactly
+        lr_start=5e-3,
+        lr_end=5e-4,
+        lr_decay_iters=2_000_000,
 
         # --- Inner SGLD steps schedule ---
         K0=12,
@@ -1097,16 +1102,16 @@ if __name__ == "__main__":
         aa_every=1,
 
         # --- Eval/log slimming ---
-        P_eval_full=100_000,    # full eval only at ES/final
-        P_eval_routine=32_768,  # cheap routine eval
-        save_every_logs=2,      # write json every 3rd log event
+        P_eval_full=100_000,
+        P_eval_routine=32_768,
+        save_every_logs=2,
     )
-    alpha0 = 4.0
+    alpha0 = 0.1
     beta01 = alpha0 / d
-    ard = ARD(use_ard=False, alpha0=alpha0, ema=0.5, update_every=1,
+    ard = ARD(use_ard=True, alpha0=alpha0, ema=0.5, update_every=1,
               rho_min=0.0, rho_max=1e18, beta0=beta01)
 
-    out_dir = "/home/goring/mean_field_langevin/MCMC_composite/results_d35k4hm_paper_final_ard=no_fin2/1e-1_2"
+    out_dir = "/home/goring/mean_field_langevin/Index/results/1809_test_MF_d22_k3_p3_test/5e-4"
     shard_strategy = "round_robin"
 
     os.makedirs(out_dir, exist_ok=True)
@@ -1122,10 +1127,11 @@ if __name__ == "__main__":
                 target=worker_process,
                 args=(dev_id, shards[dev_id],
                       mdl.__dict__, algo.__dict__, ard.__dict__,
-                      out_dir, teacher_sets_spec, algo.use_float64),
+                      out_dir, hermite_degree, k_support),
             )
             p.start(); procs.append(p)
         for p in procs:
             p.join()
     else:
-        worker_process(0, shards[0], mdl.__dict__, algo.__dict__, ard.__dict__, out_dir, teacher_sets_spec, algo.use_float64)
+        worker_process(0, shards[0], mdl.__dict__, algo.__dict__, ard.__dict__, out_dir, hermite_degree, k_support)
+
