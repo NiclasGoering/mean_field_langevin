@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import csv
 from pathlib import Path
 import math
 import numpy as np
@@ -11,6 +12,15 @@ import torch.multiprocessing as mp
 from filelock import FileLock
 import queue as pyqueue  # for Empty exception in mp.Queue
 from torch.amp import autocast
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+def _cudagraph_mark_step_begin():
+    try:
+        torch.compiler.cudagraph_mark_step_begin()
+    except Exception:
+        pass
 
 # -----------------------------
 # Data
@@ -26,6 +36,304 @@ def generate_k_sparse_parity_data(P, d, k, device='cpu'):
     relevant = X[:, :k]
     y = torch.prod(relevant, dim=1, keepdim=True)
     return X, y
+
+def compute_parity_labels(X, support_idx):
+    return torch.prod(X[:, support_idx], dim=1, keepdim=True)
+
+def _histogram(values, bins=50, value_range=None, density=False):
+    counts, edges = np.histogram(values, bins=bins, range=value_range, density=density)
+    return {
+        "counts": counts.tolist(),
+        "bin_edges": edges.tolist(),
+    }
+
+def compute_diagnostics(model, X, y_true, support_idx, activation, eps=1e-12, include_hist=False):
+    model.eval()
+    with torch.no_grad():
+        z = X @ model.w  # (P, N)
+        if activation == 'relu':
+            g = (z > 0).to(X.dtype)
+            phi_z = F.relu(z)
+        elif activation == 'sigmoid':
+            sig = torch.sigmoid(z)
+            g = sig * (1.0 - sig)
+            phi_z = sig
+        else:
+            raise ValueError(f"Unknown activation for diagnostics: {activation}")
+
+        f = (phi_z @ model.a) / (model.N ** model.gamma)
+        r = f - y_true  # (P, 1)
+        P = X.shape[0]
+        rX = r * X  # (P, d)
+        mean_U = (g.T @ rX) / float(P)  # (N, d)
+
+        r2X2 = (r ** 2) * (X ** 2)
+        second = (g.T @ r2X2) / float(P)  # (N, d)
+        var = second - mean_U ** 2
+        std = torch.sqrt(torch.clamp(var, min=0.0))
+        snr = math.sqrt(P) * mean_U.abs() / (std + eps)
+
+        d = X.shape[1]
+        mask = torch.zeros(d, dtype=torch.bool, device=X.device)
+        mask[support_idx] = True
+        on_count = int(mask.sum().item())
+        off_count = int((~mask).sum().item())
+
+        def _mean_or_nan(t):
+            return float(t.mean().item()) if t.numel() > 0 else float("nan")
+
+        snr_on = _mean_or_nan(snr[:, mask])
+        snr_off = _mean_or_nan(snr[:, ~mask])
+
+        A = (g.T @ (y_true * X)) / float(P)
+        A_on = _mean_or_nan(A[:, mask])
+        A_off = _mean_or_nan(A[:, ~mask])
+        A_on_abs = _mean_or_nan(A[:, mask].abs())
+        A_off_abs = _mean_or_nan(A[:, ~mask].abs())
+        max_abs_A_on = float(A[:, mask].abs().max(dim=1).values.mean().item()) if on_count > 0 else float("nan")
+
+        a_vec = model.a.view(-1, 1)
+        A_tilde = (a_vec.T @ A) / (model.N ** model.gamma)
+        A_tilde_on_abs = _mean_or_nan(A_tilde[:, mask].abs())
+        A_tilde_off_abs = _mean_or_nan(A_tilde[:, ~mask].abs())
+        A_tilde_ratio = float(A_tilde_on_abs / (A_tilde_off_abs + eps)) if off_count > 0 else float("nan")
+
+        A_tilde_abs = (a_vec.abs().T @ A) / (model.N ** model.gamma)
+        A_tilde_abs_on_abs = _mean_or_nan(A_tilde_abs[:, mask].abs())
+        A_tilde_abs_off_abs = _mean_or_nan(A_tilde_abs[:, ~mask].abs())
+        A_tilde_abs_ratio = float(A_tilde_abs_on_abs / (A_tilde_abs_off_abs + eps)) if off_count > 0 else float("nan")
+
+        w = model.w
+        v = (w ** 2).mean(dim=1)
+        v_on = _mean_or_nan(v[mask])
+        v_off = _mean_or_nan(v[~mask])
+        anisotropy_ratio = float(v_on / (v_off + eps)) if off_count > 0 else float("nan")
+
+        w_on = w[mask, :]
+        w_off = w[~mask, :]
+        u = (w_on ** 2).sum(dim=0)
+        v_neuron = (w_off ** 2).sum(dim=0)
+        ratio_uv = u / (v_neuron + eps)
+
+        ratio_uv_cpu = ratio_uv.detach().cpu().numpy()
+        ratio_q = np.quantile(ratio_uv_cpu, [0.25, 0.5, 0.75]).tolist()
+
+        max_snr_on = snr[:, mask].max(dim=1).values if on_count > 0 else torch.zeros(snr.shape[0], device=snr.device)
+        max_snr_on_cpu = max_snr_on.detach().cpu().numpy()
+        max_snr_q = np.quantile(max_snr_on_cpu, [0.5, 0.9]).tolist() if max_snr_on_cpu.size > 0 else [float("nan"), float("nan")]
+        winner_fraction = float((max_snr_on > 1.0).float().mean().item()) if on_count > 0 else float("nan")
+
+        c_mode = float((r * y_true).mean().item())
+        V = r * y_true * g  # (P, N)
+        V_mean = V.mean(dim=0)  # (N,)
+        V_std = V.std(dim=0, unbiased=False)
+        snr_mode = math.sqrt(P) * V_mean.abs() / (V_std + eps)
+        snr_mode_mean = float(snr_mode.mean().item())
+        snr_mode_q90 = float(np.quantile(snr_mode.detach().cpu().numpy(), 0.9))
+
+        coupling_per_neuron = (r * g).mean(dim=0).abs()  # (N,)
+        residual_coupling = float(coupling_per_neuron.mean().item())
+
+        p_i = g.mean(dim=0)
+        polarized_fraction = float(((p_i < 0.05) | (p_i > 0.95)).float().mean().item())
+        p_clamped = torch.clamp(p_i, min=eps, max=1.0 - eps)
+        entropy = -(p_clamped * torch.log(p_clamped) + (1.0 - p_clamped) * torch.log(1.0 - p_clamped))
+        gate_entropy = float(entropy.mean().item())
+
+        diag = {
+            "snr_on": snr_on,
+            "snr_off": snr_off,
+            "A_on": A_on,
+            "A_off": A_off,
+            "A_on_abs": A_on_abs,
+            "A_off_abs": A_off_abs,
+            "max_abs_A_on": max_abs_A_on,
+            "A_tilde_on_abs": A_tilde_on_abs,
+            "A_tilde_off_abs": A_tilde_off_abs,
+            "A_tilde_ratio": A_tilde_ratio,
+            "A_tilde_abs_on_abs": A_tilde_abs_on_abs,
+            "A_tilde_abs_off_abs": A_tilde_abs_off_abs,
+            "A_tilde_abs_ratio": A_tilde_abs_ratio,
+            "v_on": v_on,
+            "v_off": v_off,
+            "anisotropy_ratio": anisotropy_ratio,
+            "mean_u": float(u.mean().item()),
+            "mean_v": float(v_neuron.mean().item()),
+            "ratio_uv_q25": ratio_q[0],
+            "ratio_uv_q50": ratio_q[1],
+            "ratio_uv_q75": ratio_q[2],
+            "max_snr_on_mean": float(max_snr_on.mean().item()),
+            "max_snr_on_std": float(max_snr_on.std(unbiased=False).item()),
+            "max_snr_on_q50": max_snr_q[0],
+            "max_snr_on_q90": max_snr_q[1],
+            "winner_fraction_gt1": winner_fraction,
+            "c_mode": c_mode,
+            "snr_mode_mean": snr_mode_mean,
+            "snr_mode_q90": snr_mode_q90,
+            "residual_coupling": residual_coupling,
+            "gate_polarized_fraction": polarized_fraction,
+            "gate_entropy": gate_entropy,
+        }
+
+        if include_hist:
+            abs_w_on = w_on.abs().detach().cpu().numpy().ravel()
+            abs_w_off = w_off.abs().detach().cpu().numpy().ravel()
+            diag["hist_abs_w_on"] = _histogram(abs_w_on, bins=50, density=True)
+            diag["hist_abs_w_off"] = _histogram(abs_w_off, bins=50, density=True)
+            diag["hist_max_snr_on"] = _histogram(max_snr_on_cpu, bins=50)
+
+        return diag
+
+def save_metrics_csv(rows, csv_path):
+    if not rows:
+        return
+    fieldnames = list(rows[0].keys())
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+def save_plots(log_rows, diag_rows, final_hist, plot_prefix):
+    if log_rows or diag_rows:
+        fig, axes = plt.subplots(11, 1, figsize=(7, 26), sharex=True)
+        ax_idx = 0
+
+        if diag_rows:
+            epochs_err = [r["epoch"] for r in diag_rows]
+            train_mse = [r["train_mse"] for r in diag_rows]
+            test_mse = [r["test_mse"] for r in diag_rows]
+            train_err = [r["train_error_01"] for r in diag_rows]
+            test_err = [r["test_error_01"] for r in diag_rows]
+
+            axes[ax_idx].plot(epochs_err, train_mse, label="train_mse")
+            axes[ax_idx].plot(epochs_err, test_mse, label="test_mse")
+            axes[ax_idx].set_ylabel("mse")
+            axes[ax_idx].legend()
+            ax_idx += 1
+
+            axes[ax_idx].plot(epochs_err, train_err, label="train_err")
+            axes[ax_idx].plot(epochs_err, test_err, label="test_err")
+            axes[ax_idx].set_ylabel("0-1 err")
+            axes[ax_idx].legend()
+            ax_idx += 1
+
+        if diag_rows:
+            epochs = [r["epoch"] for r in diag_rows]
+            snr_on = [r["snr_on"] for r in diag_rows]
+            snr_off = [r["snr_off"] for r in diag_rows]
+            max_snr_q50 = [r.get("max_snr_on_q50", float("nan")) for r in diag_rows]
+            max_snr_q90 = [r.get("max_snr_on_q90", float("nan")) for r in diag_rows]
+
+            A_on_abs = [r["A_on_abs"] for r in diag_rows]
+            A_off_abs = [r["A_off_abs"] for r in diag_rows]
+            max_abs_A_on = [r.get("max_abs_A_on", float("nan")) for r in diag_rows]
+            A_tilde_on_abs = [r.get("A_tilde_on_abs", float("nan")) for r in diag_rows]
+            A_tilde_off_abs = [r.get("A_tilde_off_abs", float("nan")) for r in diag_rows]
+            A_tilde_abs_on_abs = [r.get("A_tilde_abs_on_abs", float("nan")) for r in diag_rows]
+            A_tilde_abs_off_abs = [r.get("A_tilde_abs_off_abs", float("nan")) for r in diag_rows]
+            A_tilde_ratio = [r.get("A_tilde_ratio", float("nan")) for r in diag_rows]
+            A_tilde_abs_ratio = [r.get("A_tilde_abs_ratio", float("nan")) for r in diag_rows]
+
+            v_on = [r["v_on"] for r in diag_rows]
+            v_off = [r["v_off"] for r in diag_rows]
+            anis = [r["anisotropy_ratio"] for r in diag_rows]
+            winner_frac = [r.get("winner_fraction_gt1", float("nan")) for r in diag_rows]
+            c_mode = [r.get("c_mode", float("nan")) for r in diag_rows]
+            snr_mode_mean = [r.get("snr_mode_mean", float("nan")) for r in diag_rows]
+            snr_mode_q90 = [r.get("snr_mode_q90", float("nan")) for r in diag_rows]
+            residual_coupling = [r.get("residual_coupling", float("nan")) for r in diag_rows]
+            gate_polarized = [r.get("gate_polarized_fraction", float("nan")) for r in diag_rows]
+            gate_entropy = [r.get("gate_entropy", float("nan")) for r in diag_rows]
+
+            axes[ax_idx].plot(epochs, snr_on, label="SNR_on_mean")
+            axes[ax_idx].plot(epochs, snr_off, label="SNR_off_mean")
+            axes[ax_idx].plot(epochs, max_snr_q50, label="max_SNR_on_q50")
+            axes[ax_idx].plot(epochs, max_snr_q90, label="max_SNR_on_q90")
+            axes[ax_idx].set_ylabel("snr")
+            axes[ax_idx].legend()
+            ax_idx += 1
+
+            axes[ax_idx].plot(epochs, A_on_abs, label="A_on_abs")
+            axes[ax_idx].plot(epochs, A_off_abs, label="A_off_abs")
+            axes[ax_idx].plot(epochs, max_abs_A_on, label="max_abs_A_on")
+            axes[ax_idx].plot(epochs, A_tilde_on_abs, label="A_tilde_on_abs")
+            axes[ax_idx].plot(epochs, A_tilde_off_abs, label="A_tilde_off_abs")
+            axes[ax_idx].set_ylabel("A")
+            axes[ax_idx].legend()
+            ax_idx += 1
+
+            axes[ax_idx].plot(epochs, A_tilde_abs_on_abs, label="A_tilde_abs_on_abs")
+            axes[ax_idx].plot(epochs, A_tilde_abs_off_abs, label="A_tilde_abs_off_abs")
+            axes[ax_idx].set_ylabel("A |a|")
+            axes[ax_idx].legend()
+            ax_idx += 1
+
+            axes[ax_idx].plot(epochs, A_tilde_ratio, label="A_tilde_ratio")
+            axes[ax_idx].plot(epochs, A_tilde_abs_ratio, label="A_tilde_abs_ratio")
+            axes[ax_idx].set_ylabel("A ratio")
+            axes[ax_idx].legend()
+            ax_idx += 1
+
+            axes[ax_idx].plot(epochs, v_on, label="v_on")
+            axes[ax_idx].plot(epochs, v_off, label="v_off")
+            axes[ax_idx].plot(epochs, anis, label="anisotropy_ratio")
+            axes[ax_idx].set_ylabel("anisotropy")
+            axes[ax_idx].legend()
+            ax_idx += 1
+
+            axes[ax_idx].plot(epochs, winner_frac, label="winner_fraction_gt1")
+            axes[ax_idx].set_ylabel("winner frac")
+            axes[ax_idx].legend()
+            ax_idx += 1
+
+            axes[ax_idx].plot(epochs, c_mode, label="c_mode")
+            axes[ax_idx].plot(epochs, snr_mode_mean, label="snr_mode_mean")
+            axes[ax_idx].plot(epochs, snr_mode_q90, label="snr_mode_q90")
+            axes[ax_idx].set_ylabel("mode SNR")
+            axes[ax_idx].legend()
+            ax_idx += 1
+
+            axes[ax_idx].plot(epochs, residual_coupling, label="residual_coupling")
+            axes[ax_idx].set_ylabel("coupling")
+            axes[ax_idx].legend()
+            ax_idx += 1
+
+            axes[ax_idx].plot(epochs, gate_polarized, label="gate_polarized_fraction")
+            axes[ax_idx].plot(epochs, gate_entropy, label="gate_entropy")
+            axes[ax_idx].set_ylabel("gate stats")
+            axes[ax_idx].legend()
+            ax_idx += 1
+
+        axes[-1].set_xlabel("epoch")
+        plt.tight_layout()
+        plt.savefig(f"{plot_prefix}_summary.png", dpi=150)
+        plt.close()
+
+    if final_hist:
+        if "hist_abs_w_on" in final_hist and "hist_abs_w_off" in final_hist:
+            plt.figure(figsize=(6, 4))
+            edges = np.array(final_hist["hist_abs_w_on"]["bin_edges"])
+            centers = 0.5 * (edges[:-1] + edges[1:])
+            plt.plot(centers, final_hist["hist_abs_w_on"]["counts"], label="|w| on")
+            plt.plot(centers, final_hist["hist_abs_w_off"]["counts"], label="|w| off")
+            plt.xlabel("|w|")
+            plt.ylabel("density")
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(f"{plot_prefix}_hist_w.png", dpi=150)
+            plt.close()
+
+        if "hist_max_snr_on" in final_hist:
+            plt.figure(figsize=(6, 4))
+            edges = np.array(final_hist["hist_max_snr_on"]["bin_edges"])
+            centers = 0.5 * (edges[:-1] + edges[1:])
+            plt.plot(centers, final_hist["hist_max_snr_on"]["counts"], label="max SNR on")
+            plt.xlabel("max SNR on")
+            plt.ylabel("count")
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(f"{plot_prefix}_hist_snr.png", dpi=150)
+            plt.close()
 
 # -----------------------------
 # Model
@@ -198,6 +506,8 @@ def train_with_langevin(model, X_train, y_train, X_test, y_test, hyperparams, cu
     epochs = hyperparams['epochs']
     log_interval = hyperparams['log_interval']
     batch_size = hyperparams['batch_size']
+    diag_interval = int(hyperparams.get('diag_interval', 500))
+    diag_P = hyperparams.get('diag_P', None)
 
     # Final LR from grid (backwards compat), start LR from config or default to final
     eta_final = float(current_config['eta'])
@@ -222,6 +532,9 @@ def train_with_langevin(model, X_train, y_train, X_test, y_test, hyperparams, cu
     d = int(current_config['d'])
     k = int(current_config['k'])
     exp_id = int(current_config['exp_id'])
+    support_idx = torch.arange(k, device=device)
+    X_diag = X_train
+    y_diag = y_train
 
     # +++ GET NEW HYPERPARAM +++
     lambda_h = float(hyperparams.get("homogeneity_penalty_weight", 0.0))
@@ -264,9 +577,12 @@ def train_with_langevin(model, X_train, y_train, X_test, y_test, hyperparams, cu
     epochs_run = 0
     stop_after_epoch = None
     stopped_early = False
+    metrics_log = []
+    diag_log = []
 
     with torch.no_grad():
         with autocast("cuda", dtype=torch.bfloat16):
+            _cudagraph_mark_step_begin()
             y_pred_test0 = model(X_test)
     init_eval_mS, init_eval_noise_norm2, init_eval_err01_direct = _cavity_constants(y_pred_test0, y_test)
 
@@ -343,11 +659,19 @@ def train_with_langevin(model, X_train, y_train, X_test, y_test, hyperparams, cu
             model.eval()
             with torch.no_grad():
                 with autocast("cuda", dtype=torch.bfloat16):
+                    _cudagraph_mark_step_begin()
                     y_pred_test = model(X_test)
                 test_mse = loss_fn(y_pred_test, y_test).item()
                 test_error_01 = (torch.sign(y_pred_test) != y_test).float().mean().item()
 
             elapsed = time.time() - start_time
+            metrics_log.append({
+                "epoch": int(epoch),
+                "train_mse": float(train_mse),
+                "test_mse": float(test_mse),
+                "train_error_01": float(train_error_01),
+                "test_error_01": float(test_error_01),
+            })
             print(f"[GPU {device}] P={P_train}, d={d}, k={k}, exp={exp_id}, "
                   f"gamma={gamma_scaling_exponent}, k0={kappa_0:.3e}, eta_now={lr_t:.2e} | "
                   f"Ep {epoch:>7} | Train MSE: {train_mse:.6f} | Test MSE: {test_mse:.6f} | "
@@ -382,13 +706,41 @@ def train_with_langevin(model, X_train, y_train, X_test, y_test, hyperparams, cu
                 print(f"[GPU {device}] Early-stop completed at epoch {epoch}.")
                 break
 
+        if diag_interval > 0 and epoch % diag_interval == 0:
+            with torch.no_grad():
+                with autocast("cuda", dtype=torch.bfloat16):
+                    _cudagraph_mark_step_begin()
+                    y_pred_train_diag = model(X_train).clone()
+                    _cudagraph_mark_step_begin()
+                    y_pred_test_diag = model(X_test).clone()
+                train_mse_diag = loss_fn(y_pred_train_diag, y_train).item()
+                test_mse_diag = loss_fn(y_pred_test_diag, y_test).item()
+                train_error_diag = (torch.sign(y_pred_train_diag) != y_train).float().mean().item()
+                test_error_diag = (torch.sign(y_pred_test_diag) != y_test).float().mean().item()
+
+            diag = compute_diagnostics(
+                model=model,
+                X=X_diag,
+                y_true=y_diag,
+                support_idx=support_idx,
+                activation=activation,
+            )
+            diag["epoch"] = int(epoch)
+            diag["train_mse"] = float(train_mse_diag)
+            diag["test_mse"] = float(test_mse_diag)
+            diag["train_error_01"] = float(train_error_diag)
+            diag["test_error_01"] = float(test_error_diag)
+            diag_log.append(diag)
+
         epochs_run = epoch
 
     # Final evaluation
     model.eval()
     with torch.no_grad():
         with autocast("cuda", dtype=torch.bfloat16):
+            _cudagraph_mark_step_begin()
             y_pred_train_final = model(X_train).clone()  # <-- clone here
+            _cudagraph_mark_step_begin()
             y_pred_test_final  = model(X_test)
         final_train_mse = loss_fn(y_pred_train_final, y_train).item()
         final_test_mse  = loss_fn(y_pred_test_final,  y_test ).item()
@@ -400,6 +752,15 @@ def train_with_langevin(model, X_train, y_train, X_test, y_test, hyperparams, cu
     print(f"[GPU {device}] Finished: P={P_train}, d={d}, k={k}, exp={exp_id}, "
           f"gamma={gamma_scaling_exponent}, k0={kappa_0:.3e}, eta0={eta_start:.2e}, etaf={eta_final:.2e}, "
           f"epochs_run={epochs_run}, stopped_early={stopped_early}, early_stop={early_stop_mode_str}")
+
+    final_diag = compute_diagnostics(
+        model=model,
+        X=X_diag,
+        y_true=y_diag,
+        support_idx=support_idx,
+        activation=activation,
+        include_hist=True,
+    )
 
     return {
         "train_mse": final_train_mse,
@@ -422,6 +783,9 @@ def train_with_langevin(model, X_train, y_train, X_test, y_test, hyperparams, cu
         "lr_power": lr_power,
         # NEW: record which early-stop mode was active
         "early_stop_mode": early_stop_mode_str,
+        "metrics_log": metrics_log,
+        "diag_log": diag_log,
+        "final_diag": final_diag,
     }
 
 # -----------------------------
@@ -520,6 +884,26 @@ def worker(global_rank,
             model, X_train, y_train, X_test, y_test, hyperparams, current_config, device, use_full_batch
         )
 
+        metrics_log = final_metrics.pop("metrics_log", [])
+        diag_log = final_metrics.pop("diag_log", [])
+        final_diag = final_metrics.pop("final_diag", {})
+
+        metrics_csv_path = save_dir / smart_name("metrics")
+        metrics_csv_path = metrics_csv_path.with_suffix(".csv")
+        save_metrics_csv(metrics_log, metrics_csv_path)
+
+        diag_json_path = save_dir / smart_name("diagnostics")
+        diag_json_path = diag_json_path.with_suffix(".json")
+        with open(diag_json_path, "w") as f:
+            json.dump({
+                "diag_log": diag_log,
+                "final_diag": final_diag,
+            }, f, indent=2)
+
+        plot_prefix = str((save_dir / smart_name("plots")).with_suffix(""))
+        if hyperparams.get("save_plots", True):
+            save_plots(metrics_log, diag_log, final_diag, plot_prefix)
+
         # -----------------------------
         # SAVE FINAL SNAPSHOT (FROZEN COPY)
         # -----------------------------
@@ -542,6 +926,9 @@ def worker(global_rank,
             "status": "trained",
             "init_model_path": str(init_path),
             "final_model_path": str(final_path),
+            "metrics_csv_path": str(metrics_csv_path),
+            "diagnostics_json_path": str(diag_json_path),
+            "plots_prefix": plot_prefix,
             # Keep success flag purely for reporting
             "success": is_success(final_metrics["train_error_01"], final_metrics["test_error_01"]),
         }
@@ -562,7 +949,7 @@ def main():
         "g_a": 1.0,
         
         # Activation function: 'relu' or 'sigmoid'
-        "activation": "sigmoid",  # Change to 'relu' for ReLU activation
+        "activation": "relu",  # Change to 'relu' for ReLU activation
 
         # +++ NEW HYPERPARAMETER +++
         # Strength of the homogeneity penalty.
@@ -580,9 +967,12 @@ def main():
         # LR schedule knobs
         "lr_decay_steps": 5_000_000,  # try 300_000 (aggressive) or 2_000_000 (conservative)
         "lr_power": 2.0,
+        "diag_interval": 500,
+        "diag_P": 5000,
+        "save_plots": True,
 
         # Number of runs per unique (d, k, P, kappa_0, eta, gamma)
-        "num_exp": 2,
+        "num_exp": 1,
 
         # Optional seed family
         "base_seed": 12345,
@@ -595,15 +985,15 @@ def main():
     }
 
     # --- Save directory ---
-    base_save_dir = Path("/home/goring/mean_field_langevin/Langevin_training/results_rebuttal/d35_k3_sig_full")
+    base_save_dir = Path("/home/goring/mean_field_langevin/Langevin_training/results_icml2027/SNR_1501_5")
     base_save_dir.mkdir(exist_ok=True, parents=True)
 
     # --- Experiment Grids (ORDER MATTERS) ---
     d_values = [35]
-    k_values = [3]  # k <= d
+    k_values = [4]  # k <= d
 
     # P descending (start from largest P)
-    P_values = [10,100,500,1000,2333,5000,7666,10000]#[500,1000,10000,2133 ,10, 100, 750, 3666, 5000, 7500,20000,30000,50000]
+    P_values = [10,100,500,1000,10000,2133, 750, 3666, 5000, 7500,20000,30000]#[500,1000,10000,2133 ,10, 100, 750, 3666, 5000, 7500,20000,30000,50000]
     #P_values = sorted(P_values, reverse=True)  # descending
 
     # kappa ascending (start from smallest kappa
